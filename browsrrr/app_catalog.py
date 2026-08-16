@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-import codecs
+import ctypes
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+from . import win32_api as api
+
 RECENT_CAP = 12
-SCAN_LIMIT = 200
-LNK_FALLBACK_CAP = 150
+INDEX_CAP = 1000
+SHGFI_ICON = 0x00000100
 
 
 @dataclass(frozen=True)
@@ -73,110 +76,70 @@ def record_recent(command: str, file: Optional[Path] = None) -> None:
     save_entries(path, entries[:RECENT_CAP])
 
 
-# ---------------------------------------------------------------- Windows sources / COM
+# ---------------------------------------------------------------- Start-Menu index
 
-def _com_enter():
-    import ctypes
+def _app_paths_full(exe_name: str) -> Optional[str]:
+    """Resolves bare exe names (e.g. notepad.exe) via the App Paths registry key."""
+    import winreg
 
-    ole32 = ctypes.windll.ole32
-    hr = ole32.CoInitializeEx(None, 2)
-    return ole32, hr
-
-
-def _com_exit(ole32, hr) -> None:
-    if hr == 0:
-        ole32.CoUninitialize()
-
-
-def resolve_shortcut(lnk_path: str) -> Optional[str]:
-    if os.name != "nt":
-        return None
-    try:
-        import ctypes
-
-        ole32, hr_init = _com_enter()
+    for hkey in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
         try:
-            GUID = ctypes.c_char * 16
-            clsid, iid_link, iid_file = GUID(), GUID(), GUID()
-            ole32.CLSIDFromString("{00021401-0000-0000-C000-000000000046}", clsid)
-            ole32.CLSIDFromString("{000214F9-0000-0000-C000-000000000046}", iid_link)
-            ole32.CLSIDFromString("{0000010B-0000-0000-C000-000000000046}", iid_file)
-
-            link = ctypes.c_void_p()
-            if ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid_link), ctypes.byref(link)) != 0:
-                return None
-            link_vt = ctypes.cast(link, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
-
-            persist = ctypes.c_void_p()
-            qi = ctypes.CFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))(link_vt[0])
-            release = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(link_vt[2])
-            if qi(link, iid_file, ctypes.byref(persist)) != 0:
-                release(link)
-                return None
-
-            persist_vt = ctypes.cast(persist, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
-            load = ctypes.CFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong)(persist_vt[6])
-            ok = load(persist, lnk_path, 0)
-            ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(persist_vt[2])(persist)
-
-            target = None
-            if ok == 0:
-                get_path = ctypes.CFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong)(link_vt[3])
-                buf = ctypes.create_unicode_buffer(260)
-                if get_path(link, buf, 260, None, 0) == 0 and buf.value:
-                    target = buf.value
-            release(link)
-            return target
+            key = winreg.OpenKey(
+                hkey, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+            )
+        except OSError:
+            continue
+        try:
+            value, _ = winreg.QueryValueEx(key, "")
+            if value:
+                return value
+        except OSError:
+            pass
         finally:
-            _com_exit(ole32, hr_init)
-    except Exception:
-        return None
+            winreg.CloseKey(key)
+    return None
 
 
-# ---------------------------------------------------------------- Desktop scan
-
-def desktop_dirs() -> list[Path]:
-    dirs: list[Path] = []
-    public = os.environ.get("PUBLIC")
-    if public:
-        dirs.append(Path(public) / "Desktop")
-    dirs.append(Path.home() / "Desktop")
-    dirs.append(Path.home() / "OneDrive" / "Desktop")
-    seen: set[Path] = set()
-    out: list[Path] = []
-    for d in dirs:
-        if d.exists() and d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out
-
-
-def scan_desktop_apps(limit: int = SCAN_LIMIT) -> list[AppEntry]:
-    """Only the shortcuts that live on the user's desktop."""
+def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
+    """The same app list the Start Menu uses (Win32 + packaged), via Get-StartApps."""
     if os.name != "nt":
         return []
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-StartApps | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        data = json.loads(proc.stdout)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+
     entries: list[AppEntry] = []
     seen: set[str] = set()
-    for d in desktop_dirs():
-        for lnk in sorted(d.glob("*.lnk")):
-            target = resolve_shortcut(str(lnk))
-            if not target or not target.lower().endswith(".exe"):
-                continue
-            key = target.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            entries.append(AppEntry(name=lnk.stem, path=target, lnk=str(lnk)))
-            if len(entries) >= limit:
-                return entries
-        for exe in sorted(d.glob("*.exe")):
-            key = str(exe).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            entries.append(AppEntry(name=exe.stem, path=str(exe)))
-            if len(entries) >= limit:
-                return entries
+    for item in data:
+        name = (item.get("Name") or "").strip()
+        appid = (item.get("AppID") or "").strip()
+        if not name or not appid:
+            continue
+        if appid.lower().endswith(".exe") and ":\\" not in appid:
+            full = _app_paths_full(appid)
+            if full:
+                appid = full
+        if appid.lower().endswith(".exe") or ":\\" in appid:
+            path = appid
+        else:
+            path = f"explorer.exe shell:AppsFolder\\{appid}"
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(AppEntry(name=name, path=path))
+        if len(entries) >= limit:
+            break
+    entries.sort(key=lambda e: e.name.lower())
     return entries
 
 
@@ -196,29 +159,16 @@ def app_icon(path: str, size: int = 48):
     pix = None
     if os.name == "nt" and ":\\" in path:
         try:
-            import ctypes
-
-            ole32, hr_init = _com_enter()
-            try:
-                class SHFILEINFO(ctypes.Structure):
-                    _fields_ = [
-                        ("hIcon", ctypes.c_void_p),
-                        ("iIcon", ctypes.c_int),
-                        ("dwAttributes", ctypes.c_ulong),
-                        ("displayName", ctypes.c_wchar * 260),
-                        ("typeName", ctypes.c_wchar * 80),
-                    ]
-
-                info = SHFILEINFO()
-                ok = ctypes.windll.shell32.SHGetFileInfoW(path, 0, ctypes.byref(info), ctypes.sizeof(info), 0x100)
-                if ok and info.hIcon:
-                    from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHICON", None)
-                    raw = from_hicon(info.hIcon) if from_hicon else None
-                    ctypes.windll.user32.DestroyIcon(info.hIcon)
-                    if raw is not None and not raw.isNull():
-                        pix = raw.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            finally:
-                _com_exit(ole32, hr_init)
+            info = api.SHFILEINFO()
+            ok = api.shell32.SHGetFileInfoW(
+                path, 0, ctypes.byref(info), ctypes.sizeof(info), SHGFI_ICON
+            )
+            if ok and info.hIcon:
+                from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHICON", None)
+                raw = from_hicon(info.hIcon) if from_hicon else None
+                api.user32.DestroyIcon(info.hIcon)
+                if raw is not None and not raw.isNull():
+                    pix = raw.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         except Exception:
             pix = None
 

@@ -28,8 +28,9 @@ from .app_catalog import (
     load_blocked,
     load_entries,
     record_recent,
+    recents_file,
     save_entries,
-    scan_desktop_apps,
+    scan_all_apps,
 )
 from .app_reel import AppReel
 from .code_editor_widget import CodeEditorWidget
@@ -71,7 +72,7 @@ class CatalogWorker(QThread):
     catalog_ready = Signal(list)
 
     def run(self) -> None:
-        self.catalog_ready.emit(scan_desktop_apps())
+        self.catalog_ready.emit(scan_all_apps())
 
 
 class OutsideClickFilter(QObject):
@@ -195,7 +196,7 @@ class WorkspaceWindow(QMainWindow):
         self._pre_span: tuple[int, int, int, int] | None = None
         self._floating_controls: dict[str, WindowControlsWidget] = {}
         self._reel: AppReel | None = None
-        self._catalog: list[AppEntry] = load_entries(catalog_file())
+        self._index: list[AppEntry] = load_entries(catalog_file())
         self._catalog_worker: CatalogWorker | None = None
 
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -245,7 +246,7 @@ class WorkspaceWindow(QMainWindow):
         app.screenAdded.connect(lambda *_: self._update_floating_controls())
         app.screenRemoved.connect(lambda *_: self._update_floating_controls())
 
-        # Always refresh the desktop app catalog so the reel stays accurate.
+        # Build the Start-Menu app index in the background.
         self._catalog_worker = CatalogWorker()
         self._catalog_worker.catalog_ready.connect(self._on_catalog_ready)
         self._catalog_worker.start()
@@ -358,28 +359,23 @@ class WorkspaceWindow(QMainWindow):
         self.setGeometry(x, y, w, h)
         self._workspace.clamp_subwindows()
 
-    # -- app reel (desktop shortcuts only, indexed search) -----------------------
+    # -- app reel: recents by default, live index search while typing -----------
 
     def _on_catalog_ready(self, entries: list[AppEntry]) -> None:
-        self._catalog = entries
+        self._index = entries
         save_entries(catalog_file(), entries)
-        self.statusBar().showMessage(f"App catalog refreshed: {len(entries)} apps", 4000)
-
-    def _refresh_desktop_now(self) -> None:
-        """Synchronous desktop scan so the reel is accurate the instant it opens."""
-        self._catalog = scan_desktop_apps()
+        self.statusBar().showMessage(f"App index ready: {len(entries)} apps", 4000)
 
     def _open_app_reel(self, pos) -> None:
         if self._reel is not None:
             self._reel.close()
             self._reel = None
 
-        self._refresh_desktop_now()
-
         blocked = load_blocked()
-        entries = [e for e in self._catalog if e.path.lower() not in blocked]
+        recents = [e for e in load_entries(recents_file()) if e.path.lower() not in blocked]
+        index = [e for e in self._index if e.path.lower() not in blocked]
 
-        reel = AppReel(entries, self._container)
+        reel = AppReel(recents, index, self._container)
         rx = min(max(8, pos.x() - reel.width() // 2), self.width() - reel.width() - 8)
         ry = min(max(8, pos.y() - reel.height() // 2), self.height() - reel.height() - 8)
         reel.move(rx, ry)

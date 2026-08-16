@@ -212,6 +212,9 @@ class SubWindow(QWidget):
             self._embedded_hwnds.append(embedded_hwnd)
             self._place_embedded()
 
+        if self._embedder is not None and (self._embedded_exe or self._embedded_pid):
+            self._embedder.begin_tracking(self, self._embedded_pid or 0, self._embedded_exe or "")
+
         self._adopt_timer = QTimer(self)
         self._adopt_timer.setInterval(ADOPT_INTERVAL_MS)
         self._adopt_timer.timeout.connect(self._adopt_more)
@@ -231,8 +234,7 @@ class SubWindow(QWidget):
         """
         After a grace period, confirm the app lives INSIDE the workspace:
         embedded HWNDs alive + still parented to us, and no stray same-title
-        window rendering outside. (No pixel probe — PrintWindow is unreliable
-        for reparented GPU-composed windows and false-killed good embeds.)
+        window rendering outside.
         """
         if self._verified or self._embedder is None:
             return
@@ -255,31 +257,34 @@ class SubWindow(QWidget):
 
     # -- embedded app management -------------------------------------------
 
+    def ingest_hwnd(self, hwnd: int, show: bool = True) -> None:
+        """Single adoption path used by the win-event hook, poll, and snapshot."""
+        if self._embedder is None or hwnd in self._embedded_hwnds:
+            return
+        if not self._embedder.is_hwnd_alive(hwnd):
+            return
+        self._embedder.adopt(hwnd, int(self._content_host.winId()), show=show)
+        self._embedded_hwnds.append(hwnd)
+        self._place_embedded()
+
     def _adopt_more(self) -> None:
         if self._embedder is None:
             self._adopt_timer.stop()
             return
-        found = self._embedder.find_all_hwnds_for_launch(
+        for hwnd in self._embedder.find_all_hwnds_for_launch(
             self._embedded_pid or 0, self._embedded_exe or ""
-        )
-        if not found and self._embedded_snapshot is not None:
+        ):
+            self.ingest_hwnd(hwnd)
+        if not self._embedded_hwnds and self._embedded_snapshot is not None:
             embedded_titles = {self._embedder.hwnd_text(h) for h in self._embedded_hwnds}
             embedded_titles.discard("")
             for hwnd in self._embedder.snapshot_caption_hwnds():
-                if hwnd in self._embedded_snapshot or hwnd in self._embedded_hwnds:
+                if hwnd in self._embedded_snapshot:
                     continue
                 name = self._embedder.hwnd_image_name(hwnd)
                 title = self._embedder.hwnd_text(hwnd)
                 if (name and name.lower() in UWP_HOST_EXES) or (title and title in embedded_titles):
-                    found.append(hwnd)
-        host = int(self._content_host.winId())
-        for hwnd in found:
-            if hwnd in self._embedded_hwnds:
-                continue
-            self._embedder.adopt(hwnd, host, show=self._embedder.is_visible(hwnd))
-            self._embedded_hwnds.append(hwnd)
-        if self._embedded_hwnds:
-            self._place_embedded()
+                    self.ingest_hwnd(hwnd, show=self._embedder.is_visible(hwnd))
         self._adopt_ticks += 1
         if self._adopt_ticks >= ADOPT_TICKS:
             self._adopt_timer.stop()
@@ -357,6 +362,8 @@ class SubWindow(QWidget):
         """Closing a subwindow terminates its embedded app — it never escapes to desktop."""
         self._adopt_timer.stop()
         self._verify_timer.stop()
-        if self._embedder is not None and self._embedded_hwnds:
-            self._embedder.kill_hwnd_processes(self._embedded_hwnds)
+        if self._embedder is not None:
+            self._embedder.end_tracking(self)
+            if self._embedded_hwnds:
+                self._embedder.kill_hwnd_processes(self._embedded_hwnds)
         super().closeEvent(event)

@@ -11,21 +11,24 @@ FILTER_H = 34
 
 
 class AppReel(QWidget):
-    """Photo-reel app picker with an indexed search field at the top."""
+    """Photo-reel launcher: recents by default, live Start-Menu-index search while typing."""
 
     app_chosen = Signal(object)
     dismissed = Signal()
 
-    def __init__(self, entries: list[AppEntry], parent: QWidget) -> None:
+    def __init__(self, recents: list[AppEntry], index: list[AppEntry], parent: QWidget) -> None:
         super().__init__(parent)
-        self._all_entries = list(entries)
-        self._entries = list(entries)
+        self._recents = list(recents)
+        self._index = list(index)
+        self._recents_paths = {e.path.lower() for e in self._recents}
+        self._entries = list(self._recents)
+        self._filter_text = ""
         self._offset = 0.0
         self.setFixedSize(340, 520)
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._filter = QLineEdit(self)
-        self._filter.setPlaceholderText("Type to search apps...")
+        self._filter.setPlaceholderText("Search apps...")
         self._filter.setGeometry(12, 10, self.width() - 24, FILTER_H)
         self._filter.setStyleSheet(
             "QLineEdit { background: #303134; color: #E8EAED; border: 1px solid #5F6368; "
@@ -37,8 +40,13 @@ class AppReel(QWidget):
     # -- filtering -----------------------------------------------------------
 
     def _apply_filter(self, text: str) -> None:
+        self._filter_text = text
         t = text.strip().lower()
-        self._entries = [e for e in self._all_entries if t in e.name.lower()] if t else list(self._all_entries)
+        if t:
+            pool = self._recents + [e for e in self._index if e.path.lower() not in self._recents_paths]
+            self._entries = [e for e in pool if t in e.name.lower()]
+        else:
+            self._entries = list(self._recents)
         self._offset = 0.0
         self.update()
 
@@ -67,7 +75,6 @@ class AppReel(QWidget):
             self._offset = self._clamp_offset(self._offset + 1)
             self.update()
         elif event.key() == Qt.Key_Up:
-            self._clamp_offset(self._offset - 1)
             self._offset = self._clamp_offset(self._offset - 1)
             self.update()
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -113,7 +120,12 @@ class AppReel(QWidget):
 
         if not self._entries:
             p.setPen(QColor(200, 200, 200))
-            p.drawText(QRect(0, top, self.width(), bottom - top), Qt.AlignCenter, "No matching apps.")
+            message = (
+                "No matches."
+                if self._filter_text.strip()
+                else "No recent apps yet.\nType to search all apps."
+            )
+            p.drawText(QRect(0, top, self.width(), bottom - top), Qt.AlignCenter, message)
             return
 
         center_y = top + (bottom - top) / 2
