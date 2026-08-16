@@ -16,7 +16,6 @@ MIN_SUB_WIDTH = 200
 MIN_SUB_HEIGHT = 100
 ADOPT_TICKS = 25
 ADOPT_INTERVAL_MS = 400
-REACTIVE_ADOPT_WINDOW_TICKS = 12
 VERIFY_DELAY_WIN32_MS = 2500
 VERIFY_DELAY_PACKAGED_MS = 3000
 VERIFY_MAX_ATTEMPTS = 3
@@ -243,11 +242,15 @@ class SubWindow(QWidget):
 
     def _verify_embed(self) -> None:
         """
-        Confirm the app lives INSIDE the workspace. All launches get a small
-        retry budget so reactive packaged detection has time to kick in.
+        Confirm the app lives INSIDE the workspace. Before any failure is
+        declared, give the reactive packaged adopter one final chance — this
+        is what catches stub/redirector launches (mspaint.exe -> packaged Paint).
         """
         if self._verified or self._embedder is None:
             return
+
+        if not self._embedded_hwnds:
+            self._try_reactive_adopt()
 
         if not self._embedded_hwnds:
             self._verify_attempts += 1
@@ -306,10 +309,9 @@ class SubWindow(QWidget):
                 self._embedded_pid or 0, self._embedded_exe or "", ""
             ):
                 self.ingest_hwnd(hwnd)
-            # Stub/redirector launches (mspaint.exe -> packaged Paint): if the
-            # classic match found nothing, detect packaged windows created after
-            # launch and reclassify this launch as packaged on the fly.
-            if not self._embedded_hwnds and self._adopt_ticks <= REACTIVE_ADOPT_WINDOW_TICKS:
+            # Stub/redirector launches: if the classic match found nothing,
+            # detect packaged windows created after launch and reclassify.
+            if not self._embedded_hwnds:
                 self._try_reactive_adopt()
 
         self._adopt_ticks += 1

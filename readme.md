@@ -11,10 +11,10 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 - Native-smooth windowing — main-window resize/move driven by WM_NCHITTEST / WM_SIZING / WM_MOVING, clamped to the logical bounds of the connected monitor layout.
 - Silent embed-first launch — apps start with SW_HIDE / CREATE_NO_WINDOW; a WinEvent hook adopts windows at creation, with process-tree, AUMID, and snapshot fallbacks.
 - AUMID-aware packaged-app handling — shell:AppsFolder commands parse into AppUserModelIDs; windows match via PKEY_AppUserModel_ID / GetApplicationUserModelId; icons resolve through the AppsFolder PIDL exactly like the Start Menu.
-- Reactive packaged detection — stub/redirector launches (e.g. System32 mspaint.exe) that turn out to be packaged are reclassified on the fly by probing new windows' AUMIDs, instead of being blacklisted.
+- Stub-aware classification — Windows 11 System32 redirector stubs (mspaint.exe, notepad.exe, calc.exe) keep their packaged identity through index resolution; reactive AUMID adoption also catches stubs at runtime before any blacklist decision.
 - COM-correct shell integration — CoInitializeEx runs on the main thread at startup so PIDL/icon calls succeed from the reel's paint path.
 - Start-Menu-parity search and recents — the reel indexes Get-StartApps; recents store the real display name handed in at launch, never re-derived from paths.
-- Adaptive verification — all launches get a retry budget; failed embeds auto-kill strays (AUMID-aware) and route future launches to external mode.
+- Adaptive verification — all launches get a retry budget plus a verify-time reactive adopt pass; failed embeds auto-kill strays (AUMID-aware) and route future launches to external mode.
 - Differential spanning — floating min/max/close clusters appear on any monitor where the title bar is clipped.
 - Architecture-safe Win32 layer — typed prototypes (GetWindowLongPtrW, LONG_PTR) so 32-bit and 64-bit apps both embed correctly.
 
@@ -31,7 +31,7 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
         sub_window.py               SubWindow shell: borders, embed mgmt, verification
         title_bar.py                Custom title bar + floating control clusters
         app_reel.py                 Photo-reel launcher: recents + live index search
-        app_catalog.py              Get-StartApps index, recents, blocklist, icons
+        app_catalog.py              Get-StartApps index, stub table, recents, icons
         win32_api.py                Typed 32/64-bit Win32 prototypes + known folders
         win32_embedder.py           HWND adoption, WinEvent hook, AUMID matching
         web_subwindow.py            Chromium web subwindow content
@@ -64,7 +64,8 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 | Packaged-app icons via AppsFolder PIDL (Start-Menu parity) | Done |
 | Main-thread COM init for shell icon/PIDL calls | Done |
 | Recents with real Start-Menu display names | Done |
-| Reactive packaged detection for stub/redirector exes | Done |
+| System32 stub table preserves packaged identity in the index | Done |
+| Verify-time reactive AUMID adoption (stub coverage at runtime) | Done |
 | Adaptive embed verification with retry budget | Done |
 | Stray-window detection, AUMID-aware auto-kill, blocklist routing | Done |
 | App reel: complete Start-Menu index (Get-StartApps) with live search | Done |
@@ -78,7 +79,7 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 
 ## Known Platform Limitation
 
-WindowsApps-folder packaged exes that refuse reparenting are detected and launched as normal windows (the only way they render 100% correctly). shell:AppsFolder packaged apps embed via AUMID matching with an adaptive grace period; if verification ultimately fails they are killed, blocked, and routed to external mode.
+WindowsApps-folder packaged exes that refuse reparenting are detected and launched as normal windows (the only way they render 100% correctly). shell:AppsFolder packaged apps and System32 stubs embed via AUMID matching with adaptive grace; if verification ultimately fails they are killed, blocked, and routed to external mode.
 
 ## Next Steps
 

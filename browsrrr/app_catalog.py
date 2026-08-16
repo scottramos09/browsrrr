@@ -15,6 +15,10 @@ INDEX_CAP = 1000
 SHGFI_ICON = 0x00000100
 SHGFI_PIDL = 0x00000008
 
+# Windows 11 System32 compatibility stubs that redirect to a packaged process.
+# Resolving these through App Paths must not discard their packaged identity.
+STUB_EXES = {"mspaint.exe", "notepad.exe", "calc.exe"}
+
 
 @dataclass(frozen=True)
 class AppEntry:
@@ -126,10 +130,22 @@ def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
         appid = (item.get("AppID") or "").strip()
         if not name or not appid:
             continue
+
         if appid.lower().endswith(".exe") and ":\\" not in appid:
+            if appid.lower() in STUB_EXES:
+                # Redirector stub: keep the bare name as the launch command so the
+                # shell resolves it, and carry the resolved path in `lnk` purely
+                # for icon extraction. Packaged identity survives to launch time.
+                resolved = _app_paths_full(appid)
+                key = appid.lower()
+                if key not in seen:
+                    seen.add(key)
+                    entries.append(AppEntry(name=name, path=appid, lnk=resolved or ""))
+                continue
             full = _app_paths_full(appid)
             if full:
                 appid = full
+
         if appid.lower().endswith(".exe") or ":\\" in appid:
             path = appid
         else:
