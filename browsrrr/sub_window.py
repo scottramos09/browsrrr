@@ -16,9 +16,12 @@ MIN_SUB_WIDTH = 200
 MIN_SUB_HEIGHT = 100
 ADOPT_TICKS = 25
 ADOPT_INTERVAL_MS = 400
+REACTIVE_ADOPT_WINDOW_TICKS = 12
 VERIFY_DELAY_WIN32_MS = 2500
 VERIFY_DELAY_PACKAGED_MS = 3000
-VERIFY_MAX_PACKAGED_ATTEMPTS = 4
+VERIFY_MAX_ATTEMPTS = 3
+WS_THICKFRAME = 0x00040000
+WS_TOOLWINDOW = 0x00000080
 
 
 def edges_at(pos: QPoint, rect, margin: int) -> Qt.Edges:
@@ -240,16 +243,16 @@ class SubWindow(QWidget):
 
     def _verify_embed(self) -> None:
         """
-        Confirm the app lives INSIDE the workspace. Packaged apps get an
-        adaptive grace period (cold starts are slow); Win32 gets one check.
+        Confirm the app lives INSIDE the workspace. All launches get a small
+        retry budget so reactive packaged detection has time to kick in.
         """
         if self._verified or self._embedder is None:
             return
 
         if not self._embedded_hwnds:
             self._verify_attempts += 1
-            if self._embedded_aumid and self._verify_attempts < VERIFY_MAX_PACKAGED_ATTEMPTS:
-                self._verify_timer.start()  # adaptive grace: retry
+            if self._verify_attempts < VERIFY_MAX_ATTEMPTS:
+                self._verify_timer.start()  # grace: retry
                 return
             self._verified = True
             self._adopt_timer.stop()
@@ -303,10 +306,35 @@ class SubWindow(QWidget):
                 self._embedded_pid or 0, self._embedded_exe or "", ""
             ):
                 self.ingest_hwnd(hwnd)
+            # Stub/redirector launches (mspaint.exe -> packaged Paint): if the
+            # classic match found nothing, detect packaged windows created after
+            # launch and reclassify this launch as packaged on the fly.
+            if not self._embedded_hwnds and self._adopt_ticks <= REACTIVE_ADOPT_WINDOW_TICKS:
+                self._try_reactive_adopt()
 
         self._adopt_ticks += 1
         if self._adopt_ticks >= ADOPT_TICKS:
             self._adopt_timer.stop()
+
+    def _try_reactive_adopt(self) -> None:
+        if self._embedder is None or self._embedded_snapshot is None:
+            return
+        for hwnd in self._embedder.snapshot_caption_hwnds():
+            if hwnd in self._embedded_snapshot or hwnd in self._embedded_hwnds:
+                continue
+            style = self._embedder.window_style(hwnd)
+            if not (style & WS_THICKFRAME) or (style & WS_TOOLWINDOW):
+                continue  # skip toasts/tool windows
+            pid = self._embedder._window_pid(hwnd)
+            aumid = self._embedder.process_aumid(pid) or self._embedder.window_aumid(hwnd)
+            if not aumid:
+                continue
+            self._embedded_aumid = aumid
+            self._embedder.begin_tracking(
+                self, self._embedded_pid or 0, self._embedded_exe or "", aumid
+            )
+            self.ingest_hwnd(hwnd)
+            return
 
     def _place_embedded(self) -> None:
         if not self._embedded_hwnds or self._embedder is None:

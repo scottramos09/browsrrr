@@ -4,7 +4,6 @@ import ctypes
 import json
 import os
 import subprocess
-from ctypes import wintypes
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -70,9 +69,10 @@ def block_entry(command: str, path: Optional[Path] = None) -> None:
     p.write_text(json.dumps(sorted(blocked), indent=2), encoding="utf-8")
 
 
-def record_recent(command: str, file: Optional[Path] = None) -> None:
+def record_recent(command: str, file: Optional[Path] = None, name: Optional[str] = None) -> None:
+    """Stores a recent launch with its real display name (Start-Menu parity)."""
     path = file or recents_file()
-    entry = AppEntry(name=Path(command.strip('"')).stem, path=command)
+    entry = AppEntry(name=name or Path(command.strip('"')).stem, path=command)
     entries = [e for e in load_entries(path) if e.path != entry.path]
     entries.insert(0, entry)
     save_entries(path, entries[:RECENT_CAP])
@@ -207,7 +207,7 @@ def app_icon(path: str, size: int = 48):
                     path, 0, ctypes.byref(info), ctypes.sizeof(info), SHGFI_ICON
                 )
                 if ok and info.hIcon:
-                    from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHICON", None)
+                    from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHIcon", None)
                     raw = from_hicon(info.hIcon) if from_hicon else None
                     api.user32.DestroyIcon(info.hIcon)
                     if raw is not None and not raw.isNull():

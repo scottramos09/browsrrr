@@ -393,6 +393,18 @@ class WorkspaceWindow(QMainWindow):
         self._close_reel()
         self.open_external_subwindow(entry.path)
 
+    # -- display names (Start-Menu parity) --------------------------------------
+
+    def _display_name_for(self, command: str) -> str:
+        cmd = command.strip().lower()
+        for entry in self._index:
+            if entry.path.lower() == cmd:
+                return entry.name
+        aumid = parse_aumid(command)
+        if aumid:
+            return aumid.split("!")[0].split(".")[-1].split("_")[0] or aumid
+        return Path(command.strip('"')).stem
+
     # -- launch routing ---------------------------------------------------------
 
     @staticmethod
@@ -420,7 +432,7 @@ class WorkspaceWindow(QMainWindow):
         except ExternalAppError as error:
             self.statusBar().showMessage(str(error), 6000)
             return
-        record_recent(command)
+        record_recent(command, name=self._display_name_for(command))
         sub = SubWindow(
             command, self._workspace,
             on_bounds_changed=self._workspace.accommodate_subwindow,
@@ -442,9 +454,9 @@ class WorkspaceWindow(QMainWindow):
         except ExternalAppError as error:
             self.statusBar().showMessage(str(error), 6000)
             return
-        record_recent(command)
+        record_recent(command, name=self._display_name_for(command))
         self.statusBar().showMessage(
-            f"{self._expected_name(command)} runs as a normal window (Windows blocks UWP embedding)",
+            f"{self._display_name_for(command)} runs as a normal window (Windows blocks UWP embedding)",
             6000,
         )
 
@@ -516,21 +528,13 @@ class WorkspaceWindow(QMainWindow):
             targets += self._embedder.find_stray_hwnds(sub._embedded_hwnds, title)
         else:
             targets += self._embedder.find_windows_by_title_contains(
-                self._expected_name(command), sub._embedded_hwnds
+                self._display_name_for(command), sub._embedded_hwnds
             )
         self._embedder.kill_hwnd_processes(targets)
 
-        name = self._expected_name(command)
+        name = self._display_name_for(command)
         self.statusBar().showMessage(f"{name} cannot be embedded; blocked from reel", 6000)
         sub.close()
-
-    @staticmethod
-    def _expected_name(command: str) -> str:
-        cmd = command.strip()
-        aumid = parse_aumid(cmd)
-        if aumid:
-            return aumid.split("!")[0].split(".")[-1].split("_")[0] or aumid
-        return Path(cmd.strip('"')).stem
 
     def _restore_subwindow(self, sub: SubWindow) -> None:
         sub.show()

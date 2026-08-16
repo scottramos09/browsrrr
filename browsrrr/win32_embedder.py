@@ -71,6 +71,7 @@ class AppEmbedder(Protocol):
     def find_hwnds_by_aumid(self, aumid: str) -> list[int]: ...
     def snapshot_caption_hwnds(self) -> set[int]: ...
     def window_aumid(self, hwnd: int) -> str: ...
+    def window_style(self, hwnd: int) -> int: ...
     def process_aumid(self, pid: int) -> str: ...
     def hwnd_text(self, hwnd: int) -> str: ...
     def find_stray_hwnds(self, embedded: list[int], title: str) -> list[int]: ...
@@ -95,6 +96,7 @@ class NullAppEmbedder:
     def find_hwnds_by_aumid(self, aumid): return []
     def snapshot_caption_hwnds(self): return set()
     def window_aumid(self, hwnd): return ""
+    def window_style(self, hwnd): return 0
     def process_aumid(self, pid): return ""
     def hwnd_text(self, hwnd): return ""
     def find_stray_hwnds(self, embedded, title): return []
@@ -201,6 +203,9 @@ class Win32AppEmbedder:
             return value
         except Exception:
             return ""
+
+    def window_style(self, hwnd: int) -> int:
+        return int(api.GetWindowLongPtr(hwnd, GWL_STYLE))
 
     def process_aumid(self, pid: int) -> str:
         """The package AUMID of a process (empty for non-packaged processes)."""
