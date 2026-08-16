@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from .ai_panel import AiPanelWidget
 from .ai_service import AiAgent
 from .app_catalog import (
+    STUB_EXES,
     AppEntry,
     block_entry,
     catalog_file,
@@ -397,8 +398,9 @@ class WorkspaceWindow(QMainWindow):
 
     def _display_name_for(self, command: str) -> str:
         cmd = command.strip().lower()
+        cmd_name = Path(cmd).name
         for entry in self._index:
-            if entry.path.lower() == cmd:
+            if entry.path.lower() == cmd or Path(entry.path).name.lower() == cmd_name:
                 return entry.name
         aumid = parse_aumid(command)
         if aumid:
@@ -409,16 +411,22 @@ class WorkspaceWindow(QMainWindow):
 
     @staticmethod
     def _is_packaged(command: str) -> bool:
+        """
+        Packaged classification: shell:AppsFolder AUMIDs, WindowsApps targets,
+        and System32 redirector stubs whose hosted UI cannot be reparented.
+        """
         if parse_aumid(command):
             return True
         cand = command.strip().strip('"')
-        return ":\\" in cand and "\\windowsapps\\" in cand.lower()
+        if ":\\" in cand and "\\windowsapps\\" in cand.lower():
+            return True
+        return Path(cand).name.lower() in STUB_EXES
 
     def open_external_subwindow(self, command: str) -> None:
         aumid = parse_aumid(command)
         exe_name = "" if aumid else Path(command.strip().strip('"')).name
 
-        # WindowsApps-packaged exes cannot be reparented; run them normally.
+        # Packaged/stub apps cannot be reparented; run them as normal windows.
         if not aumid and self._is_packaged(command):
             self._launch_external_only(command)
             return
@@ -448,7 +456,7 @@ class WorkspaceWindow(QMainWindow):
         self._place_subwindow(sub, None, None)
 
     def _launch_external_only(self, command: str) -> None:
-        """WindowsApps-packaged exes cannot be reparented; run them normally."""
+        """Packaged/stub apps cannot be reparented; run them normally."""
         try:
             self._embedder.launch(command)
         except ExternalAppError as error:
