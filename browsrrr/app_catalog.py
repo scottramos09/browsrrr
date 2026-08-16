@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import subprocess
+from ctypes import wintypes
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,7 @@ from . import win32_api as api
 RECENT_CAP = 12
 INDEX_CAP = 1000
 SHGFI_ICON = 0x00000100
+SHGFI_PIDL = 0x00000008
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,43 @@ def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
 _icon_cache: dict[str, object] = {}
 
 
+def _aumid_from_command(path: str) -> Optional[str]:
+    low = path.lower()
+    marker = "shell:appsfolder\\"
+    idx = low.find(marker)
+    if idx == -1:
+        return None
+    return path[idx + len(marker):].strip() or None
+
+
+def _icon_from_aumid(aumid: str, size: int):
+    """Real package icon via the AppsFolder PIDL (what the Start Menu renders)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QPixmap
+
+    try:
+        pidl = ctypes.c_void_p()
+        hr = api.shell32.SHParseDisplayName(f"shell:AppsFolder\\{aumid}", None,
+                                            ctypes.byref(pidl), 0, None)
+        if hr != 0 or not pidl:
+            return None
+        info = api.SHFILEINFO()
+        ok = api.shell32.SHGetFileInfoW(
+            ctypes.cast(pidl, ctypes.c_wchar_p), 0,
+            ctypes.byref(info), ctypes.sizeof(info), SHGFI_ICON | SHGFI_PIDL,
+        )
+        if not ok or not info.hIcon:
+            return None
+        from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHIcon", None)
+        raw = from_hicon(info.hIcon) if from_hicon else None
+        api.user32.DestroyIcon(info.hIcon)
+        if raw is not None and not raw.isNull():
+            return raw.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return None
+    except Exception:
+        return None
+
+
 def app_icon(path: str, size: int = 48):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPixmap
@@ -157,20 +196,24 @@ def app_icon(path: str, size: int = 48):
         return _icon_cache[key]
 
     pix = None
-    if os.name == "nt" and ":\\" in path:
-        try:
-            info = api.SHFILEINFO()
-            ok = api.shell32.SHGetFileInfoW(
-                path, 0, ctypes.byref(info), ctypes.sizeof(info), SHGFI_ICON
-            )
-            if ok and info.hIcon:
-                from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHICON", None)
-                raw = from_hicon(info.hIcon) if from_hicon else None
-                api.user32.DestroyIcon(info.hIcon)
-                if raw is not None and not raw.isNull():
-                    pix = raw.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        except Exception:
-            pix = None
+    if os.name == "nt":
+        aumid = _aumid_from_command(path)
+        if aumid:
+            pix = _icon_from_aumid(aumid, size)
+        elif ":\\" in path:
+            try:
+                info = api.SHFILEINFO()
+                ok = api.shell32.SHGetFileInfoW(
+                    path, 0, ctypes.byref(info), ctypes.sizeof(info), SHGFI_ICON
+                )
+                if ok and info.hIcon:
+                    from_hicon = getattr(QPixmap, "fromWinHICON", None) or getattr(QPixmap, "fromWinHICON", None)
+                    raw = from_hicon(info.hIcon) if from_hicon else None
+                    api.user32.DestroyIcon(info.hIcon)
+                    if raw is not None and not raw.isNull():
+                        pix = raw.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            except Exception:
+                pix = None
 
     _icon_cache[key] = pix
     return pix

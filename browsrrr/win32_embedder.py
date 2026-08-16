@@ -28,6 +28,10 @@ EVENT_OBJECT_SHOW = 0x8002
 WINEVENT_OUTOFCONTEXT = 0x0000
 WINEVENT_SKIPOWNPROCESS = 0x0002
 
+VT_LPWSTR = 31
+ERROR_INSUFFICIENT_BUFFER = 122
+IID_IPROPERTY_STORE = api.make_guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF90}")
+
 _PROTECTED_EXES = {"explorer.exe", "cmd.exe", "conhost.exe", "svchost.exe", "dwm.exe"}
 
 
@@ -35,13 +39,39 @@ class ExternalAppError(RuntimeError):
     pass
 
 
+def parse_aumid(command: str) -> Optional[str]:
+    """Extracts the AppUserModelID from a shell:AppsFolder\\<AUMID> command."""
+    low = command.lower()
+    marker = "shell:appsfolder\\"
+    idx = low.find(marker)
+    if idx == -1:
+        return None
+    return command[idx + len(marker):].strip().strip('"') or None
+
+
+class _PROPERTYKEY(ctypes.Structure):
+    _fields_ = [("fmtid", api.GUID), ("pid", ctypes.c_ulong)]
+
+
+class _PROPVARIANT(ctypes.Structure):
+    _fields_ = [
+        ("vt", ctypes.c_ushort),
+        ("r1", ctypes.c_ushort),
+        ("r2", ctypes.c_ulong),
+        ("pwsz", ctypes.c_void_p),
+    ]
+
+
 class AppEmbedder(Protocol):
     def launch(self, command: str) -> subprocess.Popen: ...
-    def begin_tracking(self, sub, pid: int, exe: str) -> None: ...
+    def begin_tracking(self, sub, pid: int, exe: str, aumid: str) -> None: ...
     def end_tracking(self, sub) -> None: ...
     def find_main_hwnd_for_command(self, pid: int, command: str, timeout_seconds: float = 10.0) -> Optional[int]: ...
+    def find_all_hwnds_for_launch(self, root_pid: int, exe_name: str, aumid: str) -> list[int]: ...
+    def find_hwnds_by_aumid(self, aumid: str) -> list[int]: ...
     def snapshot_caption_hwnds(self) -> set[int]: ...
-    def hwnd_image_name(self, hwnd: int) -> Optional[str]: ...
+    def window_aumid(self, hwnd: int) -> str: ...
+    def process_aumid(self, pid: int) -> str: ...
     def hwnd_text(self, hwnd: int) -> str: ...
     def find_stray_hwnds(self, embedded: list[int], title: str) -> list[int]: ...
     def find_windows_by_title_contains(self, text: str, exclude: list[int]) -> list[int]: ...
@@ -58,11 +88,14 @@ class AppEmbedder(Protocol):
 class NullAppEmbedder:
     def launch(self, command: str) -> subprocess.Popen:
         raise ExternalAppError("External app embedding requires Windows.")
-    def begin_tracking(self, sub, pid, exe): pass
+    def begin_tracking(self, sub, pid, exe, aumid): pass
     def end_tracking(self, sub): pass
     def find_main_hwnd_for_command(self, pid, command, timeout_seconds=10.0): return None
+    def find_all_hwnds_for_launch(self, root_pid, exe_name, aumid): return []
+    def find_hwnds_by_aumid(self, aumid): return []
     def snapshot_caption_hwnds(self): return set()
-    def hwnd_image_name(self, hwnd): return None
+    def window_aumid(self, hwnd): return ""
+    def process_aumid(self, pid): return ""
     def hwnd_text(self, hwnd): return ""
     def find_stray_hwnds(self, embedded, title): return []
     def find_windows_by_title_contains(self, text, exclude): return []
@@ -77,10 +110,10 @@ class NullAppEmbedder:
 
 
 class Win32AppEmbedder:
-    """Typed, architecture-safe embedder with instant win-event adoption."""
+    """Typed, architecture-safe embedder with AUMID-aware instant adoption."""
 
     def __init__(self) -> None:
-        self._tracking: dict[int, tuple] = {}  # id(sub) -> (sub, pid, exe_lower)
+        self._tracking: dict[int, tuple] = {}  # id(sub) -> (sub, pid, exe_lower, aumid)
         self._hook = None
         self._hook_proc = api.WINEVENTPROC(self._on_win_event)
         self._install_hook()
@@ -103,23 +136,110 @@ class Win32AppEmbedder:
         style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
         if not (style & WS_CAPTION) or (style & WS_CHILD):
             return
+
         pid = self._window_pid(hwnd)
-        image = self._process_image(pid)
-        image_base = os.path.basename(image).lower() if image else ""
-        for sub, track_pid, track_exe in list(self._tracking.values()):
-            if pid == track_pid or (track_exe and image_base == track_exe):
-                try:
-                    sub.ingest_hwnd(hwnd)
-                except Exception:
-                    pass
+        image_base = ""
+        win_aumid = ""
+        for sub, track_pid, track_exe, track_aumid in list(self._tracking.values()):
+            if hwnd in sub._embedded_hwnds:
+                continue
+            if pid == track_pid:
+                self._safe_ingest(sub, hwnd)
+                continue
+            if track_exe:
+                if not image_base:
+                    image = self._process_image(pid)
+                    image_base = os.path.basename(image).lower() if image else ""
+                if image_base == track_exe:
+                    self._safe_ingest(sub, hwnd)
+                    continue
+            if track_aumid:
+                if not win_aumid:
+                    win_aumid = self.window_aumid(hwnd) or self.process_aumid(pid)
+                if win_aumid and win_aumid == track_aumid:
+                    self._safe_ingest(sub, hwnd)
+
+    @staticmethod
+    def _safe_ingest(sub, hwnd: int) -> None:
+        try:
+            sub.ingest_hwnd(hwnd)
+        except Exception:
+            pass
 
     def _window_pid(self, hwnd: int) -> int:
         pid = ctypes.c_ulong()
         api.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         return pid.value
 
-    def begin_tracking(self, sub, pid: int, exe: str) -> None:
-        self._tracking[id(sub)] = (sub, pid, (exe or "").lower())
+    # -- AUMID identification ----------------------------------------------------
+
+    def window_aumid(self, hwnd: int) -> str:
+        """The AppUserModelID attached to a window (PKEY_AppUserModel_ID)."""
+        store = ctypes.c_void_p()
+        hr = api.shell32.SHGetPropertyStoreForWindow(
+            hwnd, ctypes.byref(IID_IPROPERTY_STORE), ctypes.byref(store)
+        )
+        if hr != 0 or not store:
+            return ""
+        try:
+            vt = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+            get_value = ctypes.CFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p,
+                ctypes.POINTER(_PROPERTYKEY), ctypes.POINTER(_PROPVARIANT),
+            )(vt[5])
+            release = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])
+            key = _PROPERTYKEY()
+            key.fmtid = api.make_guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}")
+            key.pid = 5
+            prop = _PROPVARIANT()
+            value = ""
+            if get_value(store, ctypes.byref(key), ctypes.byref(prop)) == 0:
+                if prop.vt == VT_LPWSTR and prop.pwsz:
+                    value = ctypes.wstring_at(prop.pwsz)
+                api.ole32.PropVariantClear(ctypes.byref(prop))
+            release(store)
+            return value
+        except Exception:
+            return ""
+
+    def process_aumid(self, pid: int) -> str:
+        """The package AUMID of a process (empty for non-packaged processes)."""
+        handle = api.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ""
+        try:
+            length = ctypes.c_ulong(0)
+            rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), None)
+            if rc != ERROR_INSUFFICIENT_BUFFER or length.value == 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(length.value)
+            rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), buf)
+            return buf.value if rc == 0 else ""
+        except Exception:
+            return ""
+        finally:
+            api.kernel32.CloseHandle(handle)
+
+    def find_hwnds_by_aumid(self, aumid: str) -> list[int]:
+        found: list[int] = []
+        if not aumid:
+            return found
+
+        def callback(hwnd, _lparam):
+            if not api.user32.IsWindowVisible(hwnd):
+                return True
+            style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
+            if not (style & WS_CAPTION):
+                return True
+            if self.window_aumid(hwnd) == aumid or self.process_aumid(self._window_pid(hwnd)) == aumid:
+                found.append(hwnd)
+            return True
+
+        api.user32.EnumWindows(api.WNDENUMPROC(callback), 0)
+        return found
+
+    def begin_tracking(self, sub, pid: int, exe: str, aumid: str) -> None:
+        self._tracking[id(sub)] = (sub, pid, (exe or "").lower(), aumid or "")
 
     def end_tracking(self, sub) -> None:
         self._tracking.pop(id(sub), None)
@@ -148,16 +268,17 @@ class Win32AppEmbedder:
     # -- discovery -------------------------------------------------------------
 
     def find_main_hwnd_for_command(self, pid: int, command: str, timeout_seconds: float = 10.0) -> Optional[int]:
-        exe_name = os.path.basename(command.strip().strip('"')).lower()
+        aumid = parse_aumid(command) or ""
+        exe_name = "" if aumid else os.path.basename(command.strip().strip('"')).lower()
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            found = self.find_all_hwnds_for_launch(pid, exe_name)
+            found = self.find_all_hwnds_for_launch(pid, exe_name, aumid)
             if found:
                 return found[0]
             time.sleep(0.1)
         return None
 
-    def find_all_hwnds_for_launch(self, root_pid: int, exe_name: str) -> list[int]:
+    def find_all_hwnds_for_launch(self, root_pid: int, exe_name: str, aumid: str) -> list[int]:
         tree = self._process_tree_pids(root_pid)
         exe_name = (exe_name or "").lower()
         visible: list[int] = []
@@ -172,6 +293,8 @@ class Win32AppEmbedder:
             if not match and exe_name:
                 image = self._process_image(window_pid)
                 match = bool(image) and os.path.basename(image).lower() == exe_name
+            if not match and aumid:
+                match = (self.window_aumid(hwnd) or self.process_aumid(window_pid)) == aumid
             if match:
                 (visible if api.user32.IsWindowVisible(hwnd) else hidden).append(hwnd)
             return True
@@ -191,10 +314,6 @@ class Win32AppEmbedder:
 
         api.user32.EnumWindows(api.WNDENUMPROC(callback), 0)
         return found
-
-    def hwnd_image_name(self, hwnd: int) -> Optional[str]:
-        image = self._process_image(self._window_pid(hwnd))
-        return os.path.basename(image) if image else None
 
     def hwnd_text(self, hwnd: int) -> str:
         buf = ctypes.create_unicode_buffer(512)
@@ -280,7 +399,6 @@ class Win32AppEmbedder:
                                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
         if show:
             api.user32.ShowWindow(hwnd, SW_SHOW)
-        self.force_redraw(hwnd)
 
     def place(self, hwnd: int, x: int, y: int, width: int, height: int) -> None:
         api.user32.MoveWindow(hwnd, x, y, width, height, True)

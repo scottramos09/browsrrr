@@ -16,8 +16,9 @@ MIN_SUB_WIDTH = 200
 MIN_SUB_HEIGHT = 100
 ADOPT_TICKS = 25
 ADOPT_INTERVAL_MS = 400
-VERIFY_DELAY_MS = 2500
-UWP_HOST_EXES = {"applicationframehost.exe"}
+VERIFY_DELAY_WIN32_MS = 2500
+VERIFY_DELAY_PACKAGED_MS = 3000
+VERIFY_MAX_PACKAGED_ATTEMPTS = 4
 
 
 def edges_at(pos: QPoint, rect, margin: int) -> Qt.Edges:
@@ -148,6 +149,7 @@ class SubWindow(QWidget):
         embedded_hwnd: Optional[int] = None,
         embedded_exe: Optional[str] = None,
         embedded_pid: Optional[int] = None,
+        embedded_aumid: Optional[str] = None,
         embedded_snapshot: Optional[set[int]] = None,
         embedded_command: str = "",
     ) -> None:
@@ -157,12 +159,14 @@ class SubWindow(QWidget):
         self._embedder = embedder
         self._embedded_exe = embedded_exe
         self._embedded_pid = embedded_pid
+        self._embedded_aumid = embedded_aumid
         self._embedded_snapshot = embedded_snapshot
         self._embedded_command = embedded_command
         self._embedded_hwnds: list[int] = []
         self._drag_offset = None
         self._adopt_ticks = 0
         self._verified = False
+        self._verify_attempts = 0
 
         self._is_maximized = False
         self._is_minimized = False
@@ -212,8 +216,10 @@ class SubWindow(QWidget):
             self._embedded_hwnds.append(embedded_hwnd)
             self._place_embedded()
 
-        if self._embedder is not None and (self._embedded_exe or self._embedded_pid):
-            self._embedder.begin_tracking(self, self._embedded_pid or 0, self._embedded_exe or "")
+        if self._embedder is not None and (self._embedded_exe or self._embedded_pid or self._embedded_aumid):
+            self._embedder.begin_tracking(
+                self, self._embedded_pid or 0, self._embedded_exe or "", self._embedded_aumid or ""
+            )
 
         self._adopt_timer = QTimer(self)
         self._adopt_timer.setInterval(ADOPT_INTERVAL_MS)
@@ -221,10 +227,12 @@ class SubWindow(QWidget):
 
         self._verify_timer = QTimer(self)
         self._verify_timer.setSingleShot(True)
-        self._verify_timer.setInterval(VERIFY_DELAY_MS)
+        self._verify_timer.setInterval(
+            VERIFY_DELAY_PACKAGED_MS if self._embedded_aumid else VERIFY_DELAY_WIN32_MS
+        )
         self._verify_timer.timeout.connect(self._verify_embed)
 
-        if self._embedder is not None and (self._embedded_exe or self._embedded_pid or self._embedded_snapshot):
+        if self._embedder is not None and (self._embedded_exe or self._embedded_pid or self._embedded_aumid):
             self._adopt_timer.start()
             self._verify_timer.start()
 
@@ -232,18 +240,24 @@ class SubWindow(QWidget):
 
     def _verify_embed(self) -> None:
         """
-        After a grace period, confirm the app lives INSIDE the workspace:
-        embedded HWNDs alive + still parented to us, and no stray same-title
-        window rendering outside.
+        Confirm the app lives INSIDE the workspace. Packaged apps get an
+        adaptive grace period (cold starts are slow); Win32 gets one check.
         """
         if self._verified or self._embedder is None:
             return
-        self._verified = True
-        self._adopt_timer.stop()
 
         if not self._embedded_hwnds:
+            self._verify_attempts += 1
+            if self._embedded_aumid and self._verify_attempts < VERIFY_MAX_PACKAGED_ATTEMPTS:
+                self._verify_timer.start()  # adaptive grace: retry
+                return
+            self._verified = True
+            self._adopt_timer.stop()
             self.embed_failed.emit(self, self._embedded_command, "")
             return
+
+        self._verified = True
+        self._adopt_timer.stop()
 
         host = int(self._content_host.winId())
         for hwnd in list(self._embedded_hwnds):
@@ -258,7 +272,7 @@ class SubWindow(QWidget):
     # -- embedded app management -------------------------------------------
 
     def ingest_hwnd(self, hwnd: int, show: bool = True) -> None:
-        """Single adoption path used by the win-event hook, poll, and snapshot."""
+        """Single adoption path used by the win-event hook and pollers."""
         if self._embedder is None or hwnd in self._embedded_hwnds:
             return
         if not self._embedder.is_hwnd_alive(hwnd):
@@ -271,20 +285,25 @@ class SubWindow(QWidget):
         if self._embedder is None:
             self._adopt_timer.stop()
             return
-        for hwnd in self._embedder.find_all_hwnds_for_launch(
-            self._embedded_pid or 0, self._embedded_exe or ""
-        ):
-            self.ingest_hwnd(hwnd)
-        if not self._embedded_hwnds and self._embedded_snapshot is not None:
-            embedded_titles = {self._embedder.hwnd_text(h) for h in self._embedded_hwnds}
-            embedded_titles.discard("")
+
+        if self._embedded_aumid:
+            # Packaged apps: match by window/process AUMID, not exe name.
             for hwnd in self._embedder.snapshot_caption_hwnds():
-                if hwnd in self._embedded_snapshot:
+                if hwnd in self._embedded_hwnds:
                     continue
-                name = self._embedder.hwnd_image_name(hwnd)
-                title = self._embedder.hwnd_text(hwnd)
-                if (name and name.lower() in UWP_HOST_EXES) or (title and title in embedded_titles):
-                    self.ingest_hwnd(hwnd, show=self._embedder.is_visible(hwnd))
+                if self._embedded_snapshot is not None and hwnd in self._embedded_snapshot:
+                    continue
+                if (
+                    self._embedder.window_aumid(hwnd) == self._embedded_aumid
+                    or self._embedder.process_aumid(self._embedder._window_pid(hwnd)) == self._embedded_aumid
+                ):
+                    self.ingest_hwnd(hwnd)
+        else:
+            for hwnd in self._embedder.find_all_hwnds_for_launch(
+                self._embedded_pid or 0, self._embedded_exe or "", ""
+            ):
+                self.ingest_hwnd(hwnd)
+
         self._adopt_ticks += 1
         if self._adopt_ticks >= ADOPT_TICKS:
             self._adopt_timer.stop()

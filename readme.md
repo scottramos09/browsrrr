@@ -4,15 +4,16 @@ An infinite-canvas multi-monitor workspace that embeds external Windows applicat
 
 ## Purpose
 
-BrowsRrr turns your entire monitor array into a single infinite canvas. External applications — native Win32 (32- and 64-bit), UWP/packaged apps, games, editors — launch directly into the workspace as live subwindows that resize, minimize, and move like first-class citizens. A right-click app reel searches every app on the computer (same source as the Start Menu) with real-time filtering, and remembers apps you've launched through it.
+BrowsRrr turns your entire monitor array into a single infinite canvas. External applications — native Win32 (32- and 64-bit) — launch directly into the workspace as live subwindows that resize, minimize, and move like first-class citizens. A right-click app reel searches every app on the computer (same source as the Start Menu) with real-time filtering, and remembers apps you've launched through it.
 
 ## Design Philosophy
 
 - Native-smooth windowing — main-window resize/move driven by WM_NCHITTEST / WM_SIZING / WM_MOVING, clamped to the logical bounds of the connected monitor layout.
-- Silent embed-first launch — apps start with SW_HIDE / CREATE_NO_WINDOW; a WinEvent hook adopts windows at creation, with process-tree and snapshot fallbacks.
+- Silent embed-first launch — Win32 apps start with SW_HIDE / CREATE_NO_WINDOW; a WinEvent hook adopts windows at creation, with process-tree and snapshot fallbacks.
 - Start-Menu-parity search — the reel indexes Get-StartApps (Win32 + packaged), resolves bare exe names via App Paths, and shows reel-launched recents when idle.
+- Honest platform limits — packaged/UWP apps cannot be reparented by Windows' composition engine; they are detected and launched as normal windows instead of producing broken embeds.
 - Differential spanning — floating min/max/close clusters appear on any monitor where the title bar is clipped.
-- Verification + self-blocking — a 2.5s check verifies the embed stayed parented with no stray windows; failures auto-kill, block the command, and remove it from the reel.
+- Verification + self-blocking — a 2.5s check verifies Win32 embeds stayed parented with no stray windows; failures auto-kill and route future launches to external mode.
 - Architecture-safe Win32 layer — all HWND/pointer calls use typed prototypes (GetWindowLongPtrW, LONG_PTR) so 32-bit and 64-bit apps both embed correctly.
 
 ## File Structure
@@ -55,11 +56,12 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 | Frameless main window, native resize/move, monitor-bound clamping | Done |
 | Multi-monitor differential spanning + floating control clusters | Done |
 | Subwindow border resize, title-bar drag, minimize-to-taskbar | Done |
-| Silent launch + HWND reparenting (32- and 64-bit apps) | Done |
+| Silent launch + HWND reparenting (32- and 64-bit Win32 apps) | Done |
 | WinEvent-hook instant adoption + process-tree/snapshot fallbacks | Done |
-| Stray-window detection, auto-kill, permanent blocklist | Done |
-| App reel: Start-Menu index (Get-StartApps) with live search | Done |
+| Stray-window detection, auto-kill, blocklist routing to external mode | Done |
+| App reel: complete Start-Menu index (Get-StartApps) with live search | Done |
 | App reel idle list = recents launched via the reel | Done |
+| UWP/packaged apps detected and launched as normal windows | Done |
 | Typed Win32 API layer (win32_api.py) | Done |
 | Downloads manager (Chromium) | Done |
 | Session save/restore (geometry + subwindows) | Done |
@@ -67,15 +69,20 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 | Shortcut repair/diagnostic utilities | Done |
 | PyInstaller build (build_executable.bat) | Done |
 
+## Known Platform Limitation
+
+Windows' composition engine cannot render a reparented UWP/packaged window (Paint, Clock, Calculator, etc.). BrowsRrr detects these (shell:AppsFolder paths or WindowsApps targets) and launches them as normal windows — the only way they render 100% correctly. Win32 apps embed fully.
+
 ## Next Steps
 
 1. Fuzzy reel search — rank results like the Start Menu (prefix/word-boundary matching, usage weighting).
 2. Subwindow tiling/snapping — drag to canvas edges to snap halves/quarters.
 3. Persistent workspace zones — named subwindow layouts for quick recall.
 4. Multi-workspace tabs — switchable canvases sharing the same monitor span.
-5. Embedded-app IPC — reliable clipboard/keystroke forwarding to embedded apps.
-6. Linux/macOS embedders — XEmbed / NSView reparenting equivalents.
-7. Accessibility — focus rings, screen-reader labels, high-contrast palette.
+5. UWP streaming embed — investigate DX surface capture (RDP-style) for packaged apps.
+6. Embedded-app IPC — reliable clipboard/keystroke forwarding to embedded apps.
+7. Linux/macOS embedders — XEmbed / NSView reparenting equivalents.
+8. Accessibility — focus rings, screen-reader labels, high-contrast palette.
 
 ## Running
 

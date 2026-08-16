@@ -89,8 +89,6 @@ user32.SendMessageW.restype = LONG_PTR
 user32.SendMessageW.argtypes = [HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.RedrawWindow.restype = wintypes.BOOL
 user32.RedrawWindow.argtypes = [HWND, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
-user32.GetClientRect.restype = wintypes.BOOL
-user32.GetClientRect.argtypes = [HWND, ctypes.POINTER(wintypes.RECT)]
 user32.DestroyIcon.restype = wintypes.BOOL
 user32.DestroyIcon.argtypes = [ctypes.c_void_p]
 
@@ -118,6 +116,10 @@ kernel32.Process32First.restype = wintypes.BOOL
 kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
 kernel32.Process32Next.restype = wintypes.BOOL
 kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+kernel32.GetApplicationUserModelId.restype = ctypes.c_long
+kernel32.GetApplicationUserModelId.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(ctypes.c_ulong), wintypes.LPWSTR,
+]
 
 ole32.CoInitializeEx.restype = ctypes.c_long
 ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
@@ -132,6 +134,8 @@ ole32.CoCreateInstance.argtypes = [
 ]
 ole32.CoTaskMemFree.restype = None
 ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+ole32.PropVariantClear.restype = ctypes.c_long
+ole32.PropVariantClear.argtypes = [ctypes.c_void_p]
 
 shell32.SHGetFileInfoW.restype = LONG_PTR
 shell32.SHGetFileInfoW.argtypes = [
@@ -141,6 +145,15 @@ shell32.SHGetKnownFolderPath.restype = ctypes.c_long
 shell32.SHGetKnownFolderPath.argtypes = [
     ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
     ctypes.POINTER(ctypes.c_wchar_p),
+]
+shell32.SHParseDisplayName.restype = ctypes.c_long
+shell32.SHParseDisplayName.argtypes = [
+    wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+]
+shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
+shell32.SHGetPropertyStoreForWindow.argtypes = [
+    HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
 ]
 
 

@@ -43,7 +43,7 @@ from .settings_dialog import SettingsDialog
 from .sub_window import SubWindow, SubWindowResizeFilter
 from .title_bar import CONTROLS_WIDTH, TITLE_BAR_HEIGHT, TitleBar, WindowControlsWidget
 from .web_subwindow import WebSubWindowContent
-from .win32_embedder import AppEmbedder, ExternalAppError
+from .win32_embedder import AppEmbedder, ExternalAppError, parse_aumid
 from .workspace import Workspace
 
 RESIZE_MARGIN = 8
@@ -359,7 +359,7 @@ class WorkspaceWindow(QMainWindow):
         self.setGeometry(x, y, w, h)
         self._workspace.clamp_subwindows()
 
-    # -- app reel: recents by default, live index search while typing -----------
+    # -- app reel: complete index, recents when idle ---------------------------
 
     def _on_catalog_ready(self, entries: list[AppEntry]) -> None:
         self._index = entries
@@ -371,9 +371,8 @@ class WorkspaceWindow(QMainWindow):
             self._reel.close()
             self._reel = None
 
-        blocked = load_blocked()
-        recents = [e for e in load_entries(recents_file()) if e.path.lower() not in blocked]
-        index = [e for e in self._index if e.path.lower() not in blocked]
+        recents = load_entries(recents_file())
+        index = list(self._index)
 
         reel = AppReel(recents, index, self._container)
         rx = min(max(8, pos.x() - reel.width() // 2), self.width() - reel.width() - 8)
@@ -393,6 +392,61 @@ class WorkspaceWindow(QMainWindow):
     def _launch_from_reel(self, entry: AppEntry) -> None:
         self._close_reel()
         self.open_external_subwindow(entry.path)
+
+    # -- launch routing ---------------------------------------------------------
+
+    @staticmethod
+    def _is_packaged(command: str) -> bool:
+        if parse_aumid(command):
+            return True
+        cand = command.strip().strip('"')
+        return ":\\" in cand and "\\windowsapps\\" in cand.lower()
+
+    def open_external_subwindow(self, command: str) -> None:
+        aumid = parse_aumid(command)
+        exe_name = "" if aumid else Path(command.strip().strip('"')).name
+
+        # WindowsApps-packaged exes cannot be reparented; run them normally.
+        if not aumid and self._is_packaged(command):
+            self._launch_external_only(command)
+            return
+
+        try:
+            snapshot = self._embedder.snapshot_caption_hwnds()
+            process = self._embedder.launch(command)
+            hwnd = self._embedder.find_main_hwnd_for_command(
+                process.pid, command, timeout_seconds=3.0
+            )
+        except ExternalAppError as error:
+            self.statusBar().showMessage(str(error), 6000)
+            return
+        record_recent(command)
+        sub = SubWindow(
+            command, self._workspace,
+            on_bounds_changed=self._workspace.accommodate_subwindow,
+            embedder=self._embedder,
+            embedded_hwnd=hwnd,
+            embedded_exe=exe_name,
+            embedded_pid=process.pid,
+            embedded_aumid=aumid,
+            embedded_snapshot=snapshot,
+            embedded_command=command,
+        )
+        self._wire_subwindow(sub)
+        self._place_subwindow(sub, None, None)
+
+    def _launch_external_only(self, command: str) -> None:
+        """WindowsApps-packaged exes cannot be reparented; run them normally."""
+        try:
+            self._embedder.launch(command)
+        except ExternalAppError as error:
+            self.statusBar().showMessage(str(error), 6000)
+            return
+        record_recent(command)
+        self.statusBar().showMessage(
+            f"{self._expected_name(command)} runs as a normal window (Windows blocks UWP embedding)",
+            6000,
+        )
 
     # -- subwindow factories ------------------------------------------------
 
@@ -436,30 +490,6 @@ class WorkspaceWindow(QMainWindow):
         save_settings(self._settings, self._settings_path)
         self.open_external_subwindow(command.strip())
 
-    def open_external_subwindow(self, command: str) -> None:
-        try:
-            snapshot = self._embedder.snapshot_caption_hwnds()
-            process = self._embedder.launch(command)
-            hwnd = self._embedder.find_main_hwnd_for_command(
-                process.pid, command, timeout_seconds=3.0
-            )
-        except ExternalAppError as error:
-            self.statusBar().showMessage(str(error), 6000)
-            return
-        record_recent(command)
-        sub = SubWindow(
-            command, self._workspace,
-            on_bounds_changed=self._workspace.accommodate_subwindow,
-            embedder=self._embedder,
-            embedded_hwnd=hwnd,
-            embedded_exe=Path(command.strip().strip('"')).name,
-            embedded_pid=process.pid,
-            embedded_snapshot=snapshot,
-            embedded_command=command,
-        )
-        self._wire_subwindow(sub)
-        self._place_subwindow(sub, None, None)
-
     def open_settings(self) -> None:
         dialog = SettingsDialog(self._settings, self)
         if dialog.exec():
@@ -475,12 +505,14 @@ class WorkspaceWindow(QMainWindow):
         sub.destroyed.connect(lambda *_: self._taskbar.remove_subwindow(sub))
 
     def _on_embed_failed(self, sub: SubWindow, command: str, title: str) -> None:
-        """App can't live inside the workspace: kill it everywhere, block it forever."""
+        """Embed failed: kill strays (AUMID-aware for packaged), block, close."""
         if command:
             block_entry(command)
 
         targets = list(sub._embedded_hwnds)
-        if title:
+        if sub._embedded_aumid:
+            targets += self._embedder.find_hwnds_by_aumid(sub._embedded_aumid)
+        elif title:
             targets += self._embedder.find_stray_hwnds(sub._embedded_hwnds, title)
         else:
             targets += self._embedder.find_windows_by_title_contains(
@@ -495,10 +527,9 @@ class WorkspaceWindow(QMainWindow):
     @staticmethod
     def _expected_name(command: str) -> str:
         cmd = command.strip()
-        low = cmd.lower()
-        if "shell:appsfolder" in low:
-            tail = cmd.split("\\")[-1]
-            return tail.split("!")[0].split(".")[-1].split("_")[0] or tail
+        aumid = parse_aumid(cmd)
+        if aumid:
+            return aumid.split("!")[0].split(".")[-1].split("_")[0] or aumid
         return Path(cmd.strip('"')).stem
 
     def _restore_subwindow(self, sub: SubWindow) -> None:
