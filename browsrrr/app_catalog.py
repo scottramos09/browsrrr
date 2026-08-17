@@ -102,14 +102,60 @@ def _app_paths_full(exe_name: str) -> Optional[str]:
     return None
 
 
-def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
-    """The same app list the Start Menu uses (Win32 + packaged), via Get-StartApps.
+def resolve_shortcut(lnk_path: str) -> Optional[str]:
+    if os.name != "nt":
+        return None
+    try:
+        ole32 = api.ole32
+        clsid = api.make_guid("{00021401-0000-0000-C000-000000000046}")
+        iid_link = api.make_guid("{000214F9-0000-0000-C000-000000000046}")
+        iid_file = api.make_guid("{0000010B-0000-0000-C000-000000000046}")
 
-    No per-app allowlists: redirector stubs are handled at runtime by reactive
-    AUMID discovery in the embedder, so bare exe names resolve normally here.
-    """
+        link = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid_link), ctypes.byref(link))
+        if hr != 0 or not link:
+            return None
+        link_vt = ctypes.cast(link, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        qi = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(api.GUID), ctypes.POINTER(ctypes.c_void_p))(link_vt[0])
+        release = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(link_vt[2])
+
+        persist = ctypes.c_void_p()
+        if qi(link, ctypes.byref(iid_file), ctypes.byref(persist)) != 0:
+            release(link)
+            return None
+        persist_vt = ctypes.cast(persist, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        load = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong)(persist_vt[6])
+        ok = load(persist, lnk_path, 0)
+        release(persist)
+
+        target = None
+        if ok == 0:
+            get_path = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong)(link_vt[3])
+            buf = ctypes.create_unicode_buffer(260)
+            if get_path(link, buf, 260, None, 0) == 0 and buf.value:
+                target = buf.value
+        release(link)
+        return target
+    except Exception:
+        return None
+
+
+def _shortcut_roots() -> list[Path]:
+    roots = []
+    if "PROGRAMDATA" in os.environ:
+        roots.append(Path(os.environ["PROGRAMDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    roots.append(Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    roots.append(Path.home() / "Desktop")
+    roots.append(Path.home() / "OneDrive" / "Desktop")
+    return [r for r in roots if r.exists()]
+
+
+def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
+    """Get-StartApps plus Start-Menu/desktop shortcuts it misses (VS Code, OBS, ...)."""
     if os.name != "nt":
         return []
+    entries: list[AppEntry] = []
+    seen: set[str] = set()
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -118,35 +164,43 @@ def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         data = json.loads(proc.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        for item in data:
+            name = (item.get("Name") or "").strip()
+            appid = (item.get("AppID") or "").strip()
+            if not name or not appid:
+                continue
+            if appid.lower().endswith(".exe") and ":\\" not in appid:
+                full = _app_paths_full(appid)
+                if full:
+                    appid = full
+            if appid.lower().endswith(".exe") or ":\\" in appid:
+                path = appid
+            else:
+                path = f"explorer.exe shell:AppsFolder\\{appid}"
+            key = path.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(AppEntry(name=name, path=path))
     except Exception:
-        return []
-    if isinstance(data, dict):
-        data = [data]
+        pass
 
-    entries: list[AppEntry] = []
-    seen: set[str] = set()
-    for item in data:
-        name = (item.get("Name") or "").strip()
-        appid = (item.get("AppID") or "").strip()
-        if not name or not appid:
-            continue
-        if appid.lower().endswith(".exe") and ":\\" not in appid:
-            full = _app_paths_full(appid)
-            if full:
-                appid = full
-        if appid.lower().endswith(".exe") or ":\\" in appid:
-            path = appid
-        else:
-            path = f"explorer.exe shell:AppsFolder\\{appid}"
-        key = path.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append(AppEntry(name=name, path=path))
-        if len(entries) >= limit:
-            break
+    names = {e.name.lower() for e in entries}
+    for root in _shortcut_roots():
+        for lnk in sorted(root.rglob("*.lnk")):
+            target = resolve_shortcut(str(lnk))
+            if not target or not target.lower().endswith(".exe"):
+                continue
+            name = lnk.stem
+            if name.lower() in names:
+                continue
+            names.add(name.lower())
+            entries.append(AppEntry(name=name, path=target, lnk=str(lnk)))
+
     entries.sort(key=lambda e: e.name.lower())
-    return entries
+    return entries[:limit]
 
 
 # ---------------------------------------------------------------- Icons

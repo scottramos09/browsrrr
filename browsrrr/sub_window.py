@@ -281,9 +281,10 @@ class SubWindow(QWidget):
         self._embedder.adopt(hwnd, int(self._content_host.winId()), show=show)
         self._embedded_hwnds.append(hwnd)
         self._place_embedded()
+        # Reparented composition-backed windows often need an explicit repaint.
+        self._embedder.force_redraw(hwnd)
 
     def _pick_titled(self, hwnds) -> Optional[int]:
-        """Prefer a titled window when several candidates arrive in one pass."""
         fallback: Optional[int] = None
         for hwnd in hwnds:
             if self._embedder.hwnd_text(hwnd):
@@ -297,8 +298,6 @@ class SubWindow(QWidget):
             self._adopt_timer.stop()
             return
 
-        # Universal rule: adopt ONE primary window per subwindow, then stop —
-        # identical behavior for pid/exe matches and AUMID matches.
         if not self._embedded_hwnds:
             if self._embedded_aumid:
                 best: Optional[int] = None
@@ -338,8 +337,6 @@ class SubWindow(QWidget):
                 if best is not None:
                     self.ingest_hwnd(best)
                 else:
-                    # Stub/redirector launches: discover a packaged AUMID from any
-                    # newly-created main window, regardless of the launch command.
                     self._try_reactive_adopt()
 
         self._adopt_ticks += 1
@@ -347,6 +344,12 @@ class SubWindow(QWidget):
             self._adopt_timer.stop()
 
     def _try_reactive_adopt(self) -> None:
+        """
+        Generalized fallback: claim a qualifying new main window when it either
+        carries a discoverable AUMID (reclassify onto it) OR belongs to the
+        launched process tree (covers stubs whose hosted window has no AUMID
+        readable from the frame host).
+        """
         if self._embedder is None or self._embedded_snapshot is None:
             return
         for hwnd in self._embedder.snapshot_caption_hwnds():
@@ -358,13 +361,15 @@ class SubWindow(QWidget):
                 continue
             pid = self._embedder._window_pid(hwnd)
             aumid = self._embedder.process_aumid(pid, diag=True) or self._embedder.window_aumid(hwnd, diag=True)
-            if not aumid:
+            in_tree = self._embedder.is_descendant_of(pid, self._embedded_pid or 0)
+            if not aumid and not in_tree:
                 continue
-            print(f"[diag] reactive reclassify hwnd={hwnd} aumid={aumid!r}", flush=True)
-            self._embedded_aumid = aumid
-            self._embedder.begin_tracking(
-                self, self._embedded_pid or 0, self._embedded_exe or "", aumid
-            )
+            print(f"[diag] reactive reclassify hwnd={hwnd} aumid={aumid!r} in_tree={in_tree}", flush=True)
+            if aumid:
+                self._embedded_aumid = aumid
+                self._embedder.begin_tracking(
+                    self, self._embedded_pid or 0, self._embedded_exe or "", aumid
+                )
             self.ingest_hwnd(hwnd)
             return
 

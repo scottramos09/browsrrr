@@ -37,7 +37,6 @@ IID_IPROPERTY_STORE = api.make_guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF90}")
 
 _PROTECTED_EXES = {"explorer.exe", "cmd.exe", "conhost.exe", "svchost.exe", "dwm.exe"}
 
-# Typed prototype for owner-window checks (canonical main-window predicate).
 api.user32.GetWindow.restype = api.HWND
 api.user32.GetWindow.argtypes = [api.HWND, wintypes.UINT]
 
@@ -77,6 +76,7 @@ class AppEmbedder(Protocol):
     def find_hwnds_by_aumid(self, aumid: str) -> list[int]: ...
     def snapshot_caption_hwnds(self) -> set[int]: ...
     def is_main_window(self, hwnd: int) -> bool: ...
+    def is_descendant_of(self, pid: int, root: int) -> bool: ...
     def window_aumid(self, hwnd: int, diag: bool = False) -> str: ...
     def window_style(self, hwnd: int) -> int: ...
     def process_aumid(self, pid: int, diag: bool = False) -> str: ...
@@ -102,6 +102,7 @@ class NullAppEmbedder:
     def find_hwnds_by_aumid(self, aumid): return []
     def snapshot_caption_hwnds(self): return set()
     def is_main_window(self, hwnd): return False
+    def is_descendant_of(self, pid, root): return False
     def window_aumid(self, hwnd, diag=False): return ""
     def window_style(self, hwnd): return 0
     def process_aumid(self, pid, diag=False): return ""
@@ -130,11 +131,7 @@ class Win32AppEmbedder:
     # -- canonical predicate ----------------------------------------------------
 
     def is_main_window(self, hwnd: int) -> bool:
-        """
-        The single definition of 'a real, adoptable app main window', used by
-        every matching path: visible, captioned, not a child, not a tool window,
-        and unowned (owned windows are dialogs/flyouts/helpers).
-        """
+        """Visible, captioned, not a child, not a tool window, and unowned."""
         if not api.user32.IsWindowVisible(hwnd):
             return False
         style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
@@ -146,7 +143,10 @@ class Win32AppEmbedder:
             return False
         return True
 
-    # -- creation hook: adopt windows the instant they exist ------------------
+    def is_descendant_of(self, pid: int, root: int) -> bool:
+        return bool(root) and pid in self._process_tree_pids(root)
+
+    # -- creation hook ----------------------------------------------------------
 
     def _install_hook(self) -> None:
         self._hook = api.user32.SetWinEventHook(
@@ -168,7 +168,6 @@ class Win32AppEmbedder:
         image_base = ""
         win_aumid = ""
         for sub, track_pid, track_exe, track_aumid in list(self._tracking.values()):
-            # Universal rule: one primary window per subwindow, then stop.
             if sub._embedded_hwnds or hwnd in sub._embedded_hwnds:
                 continue
             if pid == track_pid:

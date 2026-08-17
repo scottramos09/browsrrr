@@ -10,8 +10,24 @@ ITEM_H = 84
 FILTER_H = 34
 
 
+def _matches(name: str, query: str) -> bool:
+    """Token search with initials support: 'vs code' hits 'Visual Studio Code'."""
+    name_l = name.lower()
+    words = name_l.replace("_", " ").replace("-", " ").split()
+    initials = "".join(w[0] for w in words if w)
+    for token in query.split():
+        if token in name_l:
+            continue
+        if initials.startswith(token):
+            continue
+        if any(w.startswith(token) for w in words):
+            continue
+        return False
+    return True
+
+
 class AppReel(QWidget):
-    """Photo-reel launcher: recents by default, live Start-Menu-index search while typing."""
+    """Photo-reel launcher: recents by default, live index search while typing."""
 
     app_chosen = Signal(object)
     dismissed = Signal()
@@ -44,7 +60,7 @@ class AppReel(QWidget):
         t = text.strip().lower()
         if t:
             pool = self._recents + [e for e in self._index if e.path.lower() not in self._recents_paths]
-            self._entries = [e for e in pool if t in e.name.lower()]
+            self._entries = [e for e in pool if _matches(e.name, t)]
         else:
             self._entries = list(self._recents)
         self._offset = 0.0
