@@ -4,22 +4,23 @@ An infinite-canvas multi-monitor workspace that embeds external Windows applicat
 
 ## Purpose
 
-BrowsRrr turns your entire monitor array into a single infinite canvas. External applications — native Win32 (32- and 64-bit), self-hosted MSIX apps, frame-hosted XAML/UWP apps, Electron apps, and System32 redirector stubs — launch into the workspace as live subwindows that resize, minimize, and move like first-class citizens. A right-click app reel searches every app on the computer (Start Menu index plus shortcut sweep) with token/initials filtering, shows real package icons, and remembers apps you've launched through it under their real Start-Menu names.
+BrowsRrr turns your entire monitor array into a single infinite canvas. External applications — native Win32 (32- and 64-bit), self-hosted MSIX apps, frame-hosted XAML/UWP apps, Electron apps, and System32 redirector stubs — launch into the workspace as live subwindows that resize, minimize, and move like first-class citizens. A right-click app reel searches every app on the computer (Start Menu index) with token/initials filtering, shows real package icons, and remembers apps you've launched through it under their real Start-Menu names.
 
 ## Design Philosophy
 
 - Two embedding strategies, chosen per app at ingest time:
   - Reparented (SetParent into WS_CHILD) for ordinary Win32 HWNDs and self-hosted MSIX apps (Paint, Terminal).
-  - Positional overlay (never reparented) for CoreWindow/XAML UWP apps whose composition engine crashes under SetParent (Calculator, Clock): the real top-level window is continuously synced to the subwindow's content area (position, size, visibility, z-order).
+  - Positional overlay (never reparented) for CoreWindow/XAML UWP apps whose composition engine crashes under SetParent (Calculator, Clock).
 - One canonical main-window test — visible, captioned, not a child, not a tool window, unowned — used by every matching path; no per-app tuning.
 - Adopt one primary window, then stop — universal per subwindow.
-- Three-tier app identity resolution — own-process AUMID, then CoreWindow-child process AUMID (shared ApplicationFrameHost tenants), then window property store; matching always by resolved AUMID string so the shared host never cross-matches apps.
+- Three-tier app identity resolution — own-process AUMID, CoreWindow-child process AUMID, window property store; matching always by resolved AUMID string.
 - Frame-host-safe teardown — closing a subwindow kills the tenant app process, never the shared ApplicationFrameHost.
+- User-file safety — the app never opens Desktop shortcuts; every .lnk read is SHA-256 mutation-guarded and refused on any change.
 - STA COM before Qt loads — initialized at the top of main.py before any PySide6 import.
-- Reactive packaged discovery with process-tree fallback — stubs and hosted apps claimed at runtime; no hardcoded lists.
+- Reactive packaged discovery with process-tree fallback — no hardcoded lists.
 - Native-smooth windowing — WM_NCHITTEST / WM_SIZING / WM_MOVING driven, clamped to logical monitor bounds.
 - Silent embed-first launch — SW_HIDE / CREATE_NO_WINDOW, WinEvent-hook adoption, non-blocking GUI.
-- Start-Menu-parity search and recents — Get-StartApps + shortcut sweep; token + initials matching.
+- Start-Menu-parity search and recents — Get-StartApps + Start-Menu sweep; token + initials matching.
 - Adaptive verification — retry budget, post-adoption force-redraw, AUMID-aware stray kill, blocklist routing to external mode.
 - Differential spanning — floating control clusters on clipped monitors.
 - Architecture-safe Win32 layer — typed prototypes throughout.
@@ -28,7 +29,7 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 
     main.py                         Launcher: STA COM init before Qt, then run()
     build_executable.bat            PyInstaller build script
-    repair_shortcuts.py             Utility: restore corrupt .lnk files from Start Menu
+    repair_shortcuts.py             Utility: rebuild Desktop shortcuts from Start Menu
     check_shortcuts.py              Utility: report corrupt vs intact .lnk files
     browsrrr/
         app.py                      QApplication bootstrap + shutdown COM balance
@@ -37,7 +38,7 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
         sub_window.py               SubWindow shell: reparented + positional embedding
         title_bar.py                Custom title bar + floating control clusters
         app_reel.py                 Photo-reel launcher: recents + token/initials search
-        app_catalog.py              App index (Get-StartApps + shortcuts), recents, icons
+        app_catalog.py              App index (Start Menu only), recents, guarded icons
         win32_api.py                Typed 32/64-bit Win32 prototypes + known folders
         win32_embedder.py           Canonical predicate, adoption, AUMID resolution,
                                     positional overlay primitives
@@ -62,14 +63,14 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 | Universal adopt-one-primary-then-stop | Done |
 | STA COM pre-Qt init | Done |
 | CoreWindow-child AUMID fallback for frame-hosted UWP | Done |
-| Positional overlay embedding for CoreWindow apps (no reparent crash) | Done |
+| Positional overlay embedding for CoreWindow apps | Done |
 | Frame-host-safe process teardown | Done |
 | Reactive discovery + process-tree fallback | Done |
-| Post-adoption force-redraw | Done |
 | Non-blocking adoption (hook + poll, no GUI stalls) | Done |
 | AppsFolder PIDL icons (Start-Menu parity) | Done |
 | Recents with real Start-Menu display names | Done |
-| Index sweep: Start Menu + desktop shortcuts beyond Get-StartApps | Done |
+| Index sweep limited to Start Menu roots (Desktop never touched) | Done |
+| SHA-256 mutation guard on every .lnk read | Done |
 | Token + initials reel search | Done |
 | Stub/WindowsApps routing: external only for genuinely un-embeddable forms | Done |
 | Adaptive verification with retry budget | Done |

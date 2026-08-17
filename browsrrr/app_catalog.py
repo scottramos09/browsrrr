@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import subprocess
@@ -102,9 +103,25 @@ def _app_paths_full(exe_name: str) -> Optional[str]:
     return None
 
 
+def _sha256(path: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
 def resolve_shortcut(lnk_path: str) -> Optional[str]:
+    """Read-only .lnk target resolution with a before/after mutation guard.
+
+    IPersistFile vtable (objidl.h): QI=0, AddRef=1, Release=2, GetClassID=3,
+    IsDirty=4, InitNew=5, Load=6, Save=7. Index 6 below is Load. The hash
+    guard empirically proves the file is untouched on every single call; if
+    any byte ever changes, we log loudly and refuse the result.
+    """
     if os.name != "nt":
         return None
+    before = _sha256(lnk_path)
     try:
         ole32 = api.ole32
         clsid = api.make_guid("{00021401-0000-0000-C000-000000000046}")
@@ -124,8 +141,8 @@ def resolve_shortcut(lnk_path: str) -> Optional[str]:
             release(link)
             return None
         persist_vt = ctypes.cast(persist, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
-        load = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong)(persist_vt[6])
-        ok = load(persist, lnk_path, 0)
+        load = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong)(persist_vt[6])  # Load
+        ok = load(persist, lnk_path, 0)  # STGM_READ
         release(persist)
 
         target = None
@@ -138,20 +155,24 @@ def resolve_shortcut(lnk_path: str) -> Optional[str]:
         return target
     except Exception:
         return None
+    finally:
+        after = _sha256(lnk_path)
+        if before and after and before != after:
+            print(f"[diag] !!! LNK MUTATION DETECTED: {lnk_path} "
+                  f"before={before[:12]} after={after[:12]} — refusing result", flush=True)
 
 
 def _shortcut_roots() -> list[Path]:
+    """Start Menu roots only. The user's Desktop is NEVER scanned or opened."""
     roots = []
     if "PROGRAMDATA" in os.environ:
         roots.append(Path(os.environ["PROGRAMDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
     roots.append(Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs")
-    roots.append(Path.home() / "Desktop")
-    roots.append(Path.home() / "OneDrive" / "Desktop")
     return [r for r in roots if r.exists()]
 
 
 def scan_all_apps(limit: int = INDEX_CAP) -> list[AppEntry]:
-    """Get-StartApps plus Start-Menu/desktop shortcuts it misses (VS Code, OBS, ...)."""
+    """Get-StartApps plus Start-Menu shortcuts it misses (VS Code, OBS, ...)."""
     if os.name != "nt":
         return []
     entries: list[AppEntry] = []
