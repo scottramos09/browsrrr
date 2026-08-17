@@ -70,9 +70,9 @@ class AppEmbedder(Protocol):
     def find_all_hwnds_for_launch(self, root_pid: int, exe_name: str, aumid: str) -> list[int]: ...
     def find_hwnds_by_aumid(self, aumid: str) -> list[int]: ...
     def snapshot_caption_hwnds(self) -> set[int]: ...
-    def window_aumid(self, hwnd: int) -> str: ...
+    def window_aumid(self, hwnd: int, diag: bool = False) -> str: ...
     def window_style(self, hwnd: int) -> int: ...
-    def process_aumid(self, pid: int) -> str: ...
+    def process_aumid(self, pid: int, diag: bool = False) -> str: ...
     def hwnd_text(self, hwnd: int) -> str: ...
     def find_stray_hwnds(self, embedded: list[int], title: str) -> list[int]: ...
     def find_windows_by_title_contains(self, text: str, exclude: list[int]) -> list[int]: ...
@@ -95,9 +95,9 @@ class NullAppEmbedder:
     def find_all_hwnds_for_launch(self, root_pid, exe_name, aumid): return []
     def find_hwnds_by_aumid(self, aumid): return []
     def snapshot_caption_hwnds(self): return set()
-    def window_aumid(self, hwnd): return ""
+    def window_aumid(self, hwnd, diag=False): return ""
     def window_style(self, hwnd): return 0
-    def process_aumid(self, pid): return ""
+    def process_aumid(self, pid, diag=False): return ""
     def hwnd_text(self, hwnd): return ""
     def find_stray_hwnds(self, embedded, title): return []
     def find_windows_by_title_contains(self, text, exclude): return []
@@ -175,13 +175,16 @@ class Win32AppEmbedder:
 
     # -- AUMID identification ----------------------------------------------------
 
-    def window_aumid(self, hwnd: int) -> str:
+    def window_aumid(self, hwnd: int, diag: bool = False) -> str:
         """The AppUserModelID attached to a window (PKEY_AppUserModel_ID)."""
         store = ctypes.c_void_p()
         hr = api.shell32.SHGetPropertyStoreForWindow(
             hwnd, ctypes.byref(IID_IPROPERTY_STORE), ctypes.byref(store)
         )
         if hr != 0 or not store:
+            if diag:
+                print(f"[diag] window_aumid hwnd={hwnd} SHGetPropertyStoreForWindow "
+                      f"hr={hr & 0xFFFFFFFF:#x} store={bool(store)}", flush=True)
             return ""
         try:
             vt = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
@@ -195,32 +198,46 @@ class Win32AppEmbedder:
             key.pid = 5
             prop = _PROPVARIANT()
             value = ""
-            if get_value(store, ctypes.byref(key), ctypes.byref(prop)) == 0:
+            gv = get_value(store, ctypes.byref(key), ctypes.byref(prop))
+            if gv == 0:
                 if prop.vt == VT_LPWSTR and prop.pwsz:
                     value = ctypes.wstring_at(prop.pwsz)
                 api.ole32.PropVariantClear(ctypes.byref(prop))
+            elif diag:
+                print(f"[diag] window_aumid hwnd={hwnd} GetValue hr={gv & 0xFFFFFFFF:#x} "
+                      f"vt={prop.vt}", flush=True)
             release(store)
             return value
-        except Exception:
+        except Exception as exc:
+            if diag:
+                print(f"[diag] window_aumid hwnd={hwnd} exception={exc!r}", flush=True)
             return ""
 
     def window_style(self, hwnd: int) -> int:
         return int(api.GetWindowLongPtr(hwnd, GWL_STYLE))
 
-    def process_aumid(self, pid: int) -> str:
+    def process_aumid(self, pid: int, diag: bool = False) -> str:
         """The package AUMID of a process (empty for non-packaged processes)."""
         handle = api.kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
+            if diag:
+                print(f"[diag] process_aumid pid={pid} OpenProcess -> NULL", flush=True)
             return ""
         try:
             length = ctypes.c_ulong(0)
             rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), None)
+            if diag:
+                print(f"[diag] process_aumid pid={pid} probe rc={rc} len={length.value}", flush=True)
             if rc != ERROR_INSUFFICIENT_BUFFER or length.value == 0:
                 return ""
             buf = ctypes.create_unicode_buffer(length.value)
             rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), buf)
+            if diag:
+                print(f"[diag] process_aumid pid={pid} final rc={rc} aumid={buf.value!r}", flush=True)
             return buf.value if rc == 0 else ""
-        except Exception:
+        except Exception as exc:
+            if diag:
+                print(f"[diag] process_aumid pid={pid} exception={exc!r}", flush=True)
             return ""
         finally:
             api.kernel32.CloseHandle(handle)

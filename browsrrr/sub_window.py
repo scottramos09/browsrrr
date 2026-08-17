@@ -169,6 +169,7 @@ class SubWindow(QWidget):
         self._adopt_ticks = 0
         self._verified = False
         self._verify_attempts = 0
+        self._diag_seen: set[int] = set()
 
         self._is_maximized = False
         self._is_minimized = False
@@ -241,11 +242,6 @@ class SubWindow(QWidget):
     # -- embed verification --------------------------------------------------
 
     def _verify_embed(self) -> None:
-        """
-        Confirm the app lives INSIDE the workspace. Before any failure is
-        declared, give the reactive packaged adopter one final chance — this
-        is what catches stub/redirector launches (mspaint.exe -> packaged Paint).
-        """
         if self._verified or self._embedder is None:
             return
 
@@ -283,6 +279,7 @@ class SubWindow(QWidget):
             return
         if not self._embedder.is_hwnd_alive(hwnd):
             return
+        print(f"[diag] ingest hwnd={hwnd} title={self._embedder.hwnd_text(hwnd)!r}", flush=True)
         self._embedder.adopt(hwnd, int(self._content_host.winId()), show=show)
         self._embedded_hwnds.append(hwnd)
         self._place_embedded()
@@ -299,10 +296,18 @@ class SubWindow(QWidget):
                     continue
                 if self._embedded_snapshot is not None and hwnd in self._embedded_snapshot:
                     continue
-                if (
-                    self._embedder.window_aumid(hwnd) == self._embedded_aumid
-                    or self._embedder.process_aumid(self._embedder._window_pid(hwnd)) == self._embedded_aumid
-                ):
+                w_aumid = self._embedder.window_aumid(hwnd, diag=True)
+                p_aumid = self._embedder.process_aumid(self._embedder._window_pid(hwnd), diag=True)
+                if hwnd not in self._diag_seen:
+                    self._diag_seen.add(hwnd)
+                    print(
+                        f"[diag] adopt candidate hwnd={hwnd} "
+                        f"title={self._embedder.hwnd_text(hwnd)!r} "
+                        f"window_aumid={w_aumid!r} process_aumid={p_aumid!r} "
+                        f"want={self._embedded_aumid!r}",
+                        flush=True,
+                    )
+                if w_aumid == self._embedded_aumid or p_aumid == self._embedded_aumid:
                     self.ingest_hwnd(hwnd)
         else:
             for hwnd in self._embedder.find_all_hwnds_for_launch(
@@ -328,9 +333,10 @@ class SubWindow(QWidget):
             if not (style & WS_THICKFRAME) or (style & WS_TOOLWINDOW):
                 continue  # skip toasts/tool windows
             pid = self._embedder._window_pid(hwnd)
-            aumid = self._embedder.process_aumid(pid) or self._embedder.window_aumid(hwnd)
+            aumid = self._embedder.process_aumid(pid, diag=True) or self._embedder.window_aumid(hwnd, diag=True)
             if not aumid:
                 continue
+            print(f"[diag] reactive reclassify hwnd={hwnd} aumid={aumid!r}", flush=True)
             self._embedded_aumid = aumid
             self._embedder.begin_tracking(
                 self, self._embedded_pid or 0, self._embedded_exe or "", aumid

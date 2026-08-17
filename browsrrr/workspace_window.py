@@ -426,7 +426,7 @@ class WorkspaceWindow(QMainWindow):
         aumid = parse_aumid(command)
         exe_name = "" if aumid else Path(command.strip().strip('"')).name
 
-        # Packaged/stub apps cannot be reparented; run them as normal windows.
+        # Packaged/stub apps that cannot be reparented: clean external launch.
         if not aumid and self._is_packaged(command):
             self._launch_external_only(command)
             return
@@ -434,18 +434,18 @@ class WorkspaceWindow(QMainWindow):
         try:
             snapshot = self._embedder.snapshot_caption_hwnds()
             process = self._embedder.launch(command)
-            hwnd = self._embedder.find_main_hwnd_for_command(
-                process.pid, command, timeout_seconds=3.0
-            )
         except ExternalAppError as error:
             self.statusBar().showMessage(str(error), 6000)
             return
         record_recent(command, name=self._display_name_for(command))
+
+        # Non-blocking: the WinEvent hook plus the 400ms adopt loop claim the
+        # window as soon as it exists. No synchronous polling on the GUI thread.
         sub = SubWindow(
             command, self._workspace,
             on_bounds_changed=self._workspace.accommodate_subwindow,
             embedder=self._embedder,
-            embedded_hwnd=hwnd,
+            embedded_hwnd=None,
             embedded_exe=exe_name,
             embedded_pid=process.pid,
             embedded_aumid=aumid,

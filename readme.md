@@ -9,12 +9,12 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 ## Design Philosophy
 
 - Native-smooth windowing — main-window resize/move driven by WM_NCHITTEST / WM_SIZING / WM_MOVING, clamped to the logical bounds of the connected monitor layout.
-- Silent embed-first launch — Win32 apps start with SW_HIDE / CREATE_NO_WINDOW; a WinEvent hook adopts windows at creation, with process-tree, AUMID, and snapshot fallbacks.
+- Silent embed-first launch — Win32 apps start with SW_HIDE / CREATE_NO_WINDOW; a WinEvent hook adopts windows at creation; adoption never blocks the GUI thread.
 - AUMID-aware packaged-app handling — shell:AppsFolder commands parse into AppUserModelIDs; windows match via PKEY_AppUserModel_ID / GetApplicationUserModelId; icons resolve through the AppsFolder PIDL exactly like the Start Menu.
-- Stub-aware routing — Windows 11 System32 redirector stubs (mspaint.exe, notepad.exe, calc.exe) and WindowsApps targets are classified packaged at launch and run as clean external windows: no failed embed attempt, no blacklist entry.
-- COM-correct shell integration — CoInitializeEx runs on the main thread at startup so PIDL/icon calls succeed from the reel's paint path.
-- Start-Menu-parity search and recents — the reel indexes Get-StartApps; recents store the real display name handed in at launch, never re-derived from paths.
-- Adaptive verification — embed attempts get a retry budget plus reactive AUMID discovery; genuine failures auto-kill strays and route future launches to external mode.
+- Stub-aware routing — System32 redirector stubs (mspaint.exe, notepad.exe, calc.exe) and WindowsApps targets run as clean external windows: no failed embed attempt, no blacklist entry.
+- COM-correct shell integration — CoInitializeEx runs on the main thread at startup so PIDL/icon/property-store calls succeed.
+- Start-Menu-parity search and recents — the reel indexes Get-StartApps; recents store the real display name handed in at launch.
+- Adaptive verification with runtime diagnostics — embed attempts get a retry budget, reactive AUMID discovery, and deduped console diagnostics at the adoption boundary.
 - Differential spanning — floating min/max/close clusters appear on any monitor where the title bar is clipped.
 - Architecture-safe Win32 layer — typed prototypes (GetWindowLongPtrW, LONG_PTR) so 32-bit and 64-bit apps both embed correctly.
 
@@ -59,14 +59,15 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 | Multi-monitor differential spanning + floating control clusters | Done |
 | Subwindow border resize, title-bar drag, minimize-to-taskbar | Done |
 | Silent launch + HWND reparenting (32- and 64-bit Win32 apps) | Done |
-| WinEvent-hook instant adoption + process-tree/snapshot fallbacks | Done |
+| Non-blocking adoption (WinEvent hook + poll loop, no GUI-thread stalls) | Done |
 | AUMID parsing + window/process AUMID matching for packaged apps | Done |
 | Packaged-app icons via AppsFolder PIDL (Start-Menu parity) | Done |
-| Main-thread COM init for shell icon/PIDL calls | Done |
+| Main-thread COM init for shell icon/PIDL/property-store calls | Done |
 | Recents with real Start-Menu display names | Done |
 | System32 stub table preserves packaged identity in the index | Done |
 | Stub/WindowsApps apps route to clean external launch (no blacklist) | Done |
 | Adaptive embed verification with retry budget + reactive AUMID discovery | Done |
+| Runtime [diag] tracing at the adoption boundary | Done (temporary) |
 | Stray-window detection, AUMID-aware auto-kill, blocklist routing | Done |
 | App reel: complete Start-Menu index (Get-StartApps) with live search | Done |
 | App reel idle list = recents launched via the reel | Done |
@@ -79,18 +80,19 @@ BrowsRrr turns your entire monitor array into a single infinite canvas. External
 
 ## Known Platform Limitation
 
-Windows' composition engine cannot reparent hosted/packaged UIs (shell:AppsFolder apps, WindowsApps targets, System32 redirector stubs like mspaint.exe). BrowsRrr classifies these at launch and runs them as normal external windows — the only way they render 100% correctly — while Win32 apps embed fully into workspace subwindows.
+Windows' composition engine cannot reparent hosted/packaged UIs (shell:AppsFolder apps, WindowsApps targets, System32 redirector stubs). BrowsRrr classifies these at launch and runs them as normal external windows — the only way they render 100% correctly — while Win32 apps embed fully into workspace subwindows.
 
 ## Next Steps
 
-1. Fuzzy reel search — rank results like the Start Menu (prefix/word-boundary matching, usage weighting).
-2. Subwindow tiling/snapping — drag to canvas edges to snap halves/quarters.
-3. Persistent workspace zones — named subwindow layouts for quick recall.
-4. Multi-workspace tabs — switchable canvases sharing the same monitor span.
-5. UWP streaming embed — investigate DX surface capture (RDP-style) for hosted apps.
-6. Embedded-app IPC — reliable clipboard/keystroke forwarding to embedded apps.
-7. Linux/macOS embedders — XEmbed / NSView reparenting equivalents.
-8. Accessibility — focus rings, screen-reader labels, high-contrast palette.
+1. Resolve packaged-app embed diagnostics (current [diag] pass) and finalize AUMID matching strategy.
+2. Fuzzy reel search — rank results like the Start Menu (prefix/word-boundary matching, usage weighting).
+3. Subwindow tiling/snapping — drag to canvas edges to snap halves/quarters.
+4. Persistent workspace zones — named subwindow layouts for quick recall.
+5. Multi-workspace tabs — switchable canvases sharing the same monitor span.
+6. UWP streaming embed — investigate DX surface capture (RDP-style) for hosted apps.
+7. Embedded-app IPC — reliable clipboard/keystroke forwarding to embedded apps.
+8. Linux/macOS embedders — XEmbed / NSView reparenting equivalents.
+9. Accessibility — focus rings, screen-reader labels, high-contrast palette.
 
 ## Running
 
