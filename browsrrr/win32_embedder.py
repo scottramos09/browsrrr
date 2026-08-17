@@ -23,7 +23,11 @@ GW_OWNER = 4
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SW_HIDE = 0
 SW_SHOW = 5
+SW_SHOWNOACTIVATE = 4
 WM_SETREDRAW = 0x000B
 
 EVENT_OBJECT_CREATE = 0x8000
@@ -34,11 +38,16 @@ WINEVENT_SKIPOWNPROCESS = 0x0002
 VT_LPWSTR = 31
 ERROR_INSUFFICIENT_BUFFER = 122
 IID_IPROPERTY_STORE = api.make_guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF90}")
+COREWINDOW_CLASS = "Windows.UI.Core.CoreWindow"
 
 _PROTECTED_EXES = {"explorer.exe", "cmd.exe", "conhost.exe", "svchost.exe", "dwm.exe"}
 
 api.user32.GetWindow.restype = api.HWND
 api.user32.GetWindow.argtypes = [api.HWND, wintypes.UINT]
+api.user32.GetClassNameW.restype = ctypes.c_int
+api.user32.GetClassNameW.argtypes = [api.HWND, wintypes.LPWSTR, ctypes.c_int]
+api.user32.EnumChildWindows.restype = wintypes.BOOL
+api.user32.EnumChildWindows.argtypes = [api.HWND, api.WNDENUMPROC, wintypes.LPARAM]
 
 
 class ExternalAppError(RuntimeError):
@@ -77,9 +86,10 @@ class AppEmbedder(Protocol):
     def snapshot_caption_hwnds(self) -> set[int]: ...
     def is_main_window(self, hwnd: int) -> bool: ...
     def is_descendant_of(self, pid: int, root: int) -> bool: ...
-    def window_aumid(self, hwnd: int, diag: bool = False) -> str: ...
-    def window_style(self, hwnd: int) -> int: ...
+    def is_corewindow_hosted(self, hwnd: int) -> bool: ...
+    def resolve_window_aumid(self, hwnd: int, diag: bool = False) -> str: ...
     def process_aumid(self, pid: int, diag: bool = False) -> str: ...
+    def window_style(self, hwnd: int) -> int: ...
     def hwnd_text(self, hwnd: int) -> str: ...
     def find_stray_hwnds(self, embedded: list[int], title: str) -> list[int]: ...
     def find_windows_by_title_contains(self, text: str, exclude: list[int]) -> list[int]: ...
@@ -89,6 +99,9 @@ class AppEmbedder(Protocol):
     def hwnd_parent(self, hwnd: int) -> int: ...
     def adopt(self, hwnd: int, parent_hwnd: int, show: bool = True) -> None: ...
     def place(self, hwnd: int, x: int, y: int, width: int, height: int) -> None: ...
+    def place_top_level(self, hwnd: int, x: int, y: int, width: int, height: int) -> None: ...
+    def show_window(self, hwnd: int, visible: bool) -> None: ...
+    def stack_overlay(self, app_hwnd: int, workspace_hwnd: int) -> None: ...
     def set_redraw(self, hwnd: int, on: bool) -> None: ...
     def force_redraw(self, hwnd: int) -> None: ...
 
@@ -103,9 +116,10 @@ class NullAppEmbedder:
     def snapshot_caption_hwnds(self): return set()
     def is_main_window(self, hwnd): return False
     def is_descendant_of(self, pid, root): return False
-    def window_aumid(self, hwnd, diag=False): return ""
-    def window_style(self, hwnd): return 0
+    def is_corewindow_hosted(self, hwnd): return False
+    def resolve_window_aumid(self, hwnd, diag=False): return ""
     def process_aumid(self, pid, diag=False): return ""
+    def window_style(self, hwnd): return 0
     def hwnd_text(self, hwnd): return ""
     def find_stray_hwnds(self, embedded, title): return []
     def find_windows_by_title_contains(self, text, exclude): return []
@@ -115,12 +129,22 @@ class NullAppEmbedder:
     def hwnd_parent(self, hwnd): return 0
     def adopt(self, hwnd, parent_hwnd, show=True): pass
     def place(self, hwnd, x, y, width, height): pass
+    def place_top_level(self, hwnd, x, y, width, height): pass
+    def show_window(self, hwnd, visible): pass
+    def stack_overlay(self, app_hwnd, workspace_hwnd): pass
     def set_redraw(self, hwnd, on): pass
     def force_redraw(self, hwnd): pass
 
 
 class Win32AppEmbedder:
-    """Typed, architecture-safe embedder with one canonical main-window test."""
+    """Typed, architecture-safe embedder.
+
+    Two embedding strategies:
+    - reparented (SetParent into WS_CHILD): ordinary Win32 HWNDs, including
+      self-hosted MSIX apps (Paint, Terminal);
+    - positional overlay (never reparented): CoreWindow/XAML UWP apps whose
+      composition engine crashes under SetParent (Calculator, Clock).
+    """
 
     def __init__(self) -> None:
         self._tracking: dict[int, tuple] = {}  # id(sub) -> (sub, pid, exe_lower, aumid)
@@ -145,6 +169,12 @@ class Win32AppEmbedder:
 
     def is_descendant_of(self, pid: int, root: int) -> bool:
         return bool(root) and pid in self._process_tree_pids(root)
+
+    def is_corewindow_hosted(self, hwnd: int) -> bool:
+        """Frame-host for a CoreWindow (XAML UWP) app => reparenting crashes it."""
+        if self.process_aumid(self._window_pid(hwnd)):
+            return False  # own process carries identity: reparent-safe family
+        return bool(self._corewindow_child_pid(hwnd))
 
     # -- creation hook ----------------------------------------------------------
 
@@ -182,7 +212,7 @@ class Win32AppEmbedder:
                     continue
             if track_aumid:
                 if not win_aumid:
-                    win_aumid = self.window_aumid(hwnd) or self.process_aumid(pid)
+                    win_aumid = self.resolve_window_aumid(hwnd)
                 if win_aumid and win_aumid == track_aumid:
                     self._safe_ingest(sub, hwnd)
 
@@ -200,8 +230,51 @@ class Win32AppEmbedder:
 
     # -- AUMID identification ----------------------------------------------------
 
+    def _corewindow_child_pid(self, hwnd: int) -> int:
+        """Pid of the real app process behind a shared ApplicationFrameHost window."""
+        found: list[int] = []
+
+        def callback(child, _lparam):
+            buf = ctypes.create_unicode_buffer(256)
+            api.user32.GetClassNameW(child, buf, 256)
+            if buf.value == COREWINDOW_CLASS:
+                found.append(self._window_pid(child))
+                return False
+            return True
+
+        api.user32.EnumChildWindows(hwnd, api.WNDENUMPROC(callback), 0)
+        return found[0] if found else 0
+
+    def process_aumid(self, pid: int, diag: bool = False) -> str:
+        """The package AUMID of a process (empty for non-packaged processes)."""
+        if not pid:
+            return ""
+        handle = api.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            if diag:
+                print(f"[diag] process_aumid pid={pid} OpenProcess -> NULL", flush=True)
+            return ""
+        try:
+            length = ctypes.c_ulong(0)
+            rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), None)
+            if diag:
+                print(f"[diag] process_aumid pid={pid} probe rc={rc} len={length.value}", flush=True)
+            if rc != ERROR_INSUFFICIENT_BUFFER or length.value == 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(length.value)
+            rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), buf)
+            if diag:
+                print(f"[diag] process_aumid pid={pid} final rc={rc} aumid={buf.value!r}", flush=True)
+            return buf.value if rc == 0 else ""
+        except Exception as exc:
+            if diag:
+                print(f"[diag] process_aumid pid={pid} exception={exc!r}", flush=True)
+            return ""
+        finally:
+            api.kernel32.CloseHandle(handle)
+
     def window_aumid(self, hwnd: int, diag: bool = False) -> str:
-        """The AppUserModelID attached to a window (PKEY_AppUserModel_ID)."""
+        """Window-level property store AUMID (weak signal; last resort)."""
         store = ctypes.c_void_p()
         hr = api.shell32.SHGetPropertyStoreForWindow(
             hwnd, ctypes.byref(IID_IPROPERTY_STORE), ctypes.byref(store)
@@ -238,34 +311,25 @@ class Win32AppEmbedder:
                 print(f"[diag] window_aumid hwnd={hwnd} exception={exc!r}", flush=True)
             return ""
 
-    def window_style(self, hwnd: int) -> int:
-        return int(api.GetWindowLongPtr(hwnd, GWL_STYLE))
-
-    def process_aumid(self, pid: int, diag: bool = False) -> str:
-        """The package AUMID of a process (empty for non-packaged processes)."""
-        handle = api.kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
+    def resolve_window_aumid(self, hwnd: int, diag: bool = False) -> str:
+        """
+        App identity for a top-level window: own process AUMID, then the
+        CoreWindow child's process AUMID (frame-hosted UWP), then the window
+        property store as a last resort.
+        """
+        pid = self._window_pid(hwnd)
+        aumid = self.process_aumid(pid, diag=diag)
+        if aumid:
+            return aumid
+        child_pid = self._corewindow_child_pid(hwnd)
+        if child_pid:
+            aumid = self.process_aumid(child_pid, diag=diag)
             if diag:
-                print(f"[diag] process_aumid pid={pid} OpenProcess -> NULL", flush=True)
-            return ""
-        try:
-            length = ctypes.c_ulong(0)
-            rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), None)
-            if diag:
-                print(f"[diag] process_aumid pid={pid} probe rc={rc} len={length.value}", flush=True)
-            if rc != ERROR_INSUFFICIENT_BUFFER or length.value == 0:
-                return ""
-            buf = ctypes.create_unicode_buffer(length.value)
-            rc = api.kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), buf)
-            if diag:
-                print(f"[diag] process_aumid pid={pid} final rc={rc} aumid={buf.value!r}", flush=True)
-            return buf.value if rc == 0 else ""
-        except Exception as exc:
-            if diag:
-                print(f"[diag] process_aumid pid={pid} exception={exc!r}", flush=True)
-            return ""
-        finally:
-            api.kernel32.CloseHandle(handle)
+                print(f"[diag] resolve hwnd={hwnd} frame pid={pid} -> "
+                      f"corewindow pid={child_pid} aumid={aumid!r}", flush=True)
+            if aumid:
+                return aumid
+        return self.window_aumid(hwnd, diag=diag)
 
     def find_hwnds_by_aumid(self, aumid: str) -> list[int]:
         found: list[int] = []
@@ -278,7 +342,7 @@ class Win32AppEmbedder:
             style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
             if not (style & WS_CAPTION):
                 return True
-            if self.window_aumid(hwnd) == aumid or self.process_aumid(self._window_pid(hwnd)) == aumid:
+            if self.resolve_window_aumid(hwnd) == aumid:
                 found.append(hwnd)
             return True
 
@@ -329,7 +393,7 @@ class Win32AppEmbedder:
                 image = self._process_image(window_pid)
                 match = bool(image) and os.path.basename(image).lower() == exe_name
             if not match and aumid:
-                match = (self.window_aumid(hwnd) or self.process_aumid(window_pid)) == aumid
+                match = self.resolve_window_aumid(hwnd) == aumid
             if match:
                 (visible if api.user32.IsWindowVisible(hwnd) else hidden).append(hwnd)
             return True
@@ -405,14 +469,24 @@ class Win32AppEmbedder:
             image = self._process_image(pid)
             if not image or os.path.basename(image).lower() in _PROTECTED_EXES:
                 continue
-            handle = api.kernel32.OpenProcess(0x0001, False, pid)
-            if handle:
-                api.kernel32.TerminateProcess(handle, 0)
-                api.kernel32.CloseHandle(handle)
-                killed.add(pid)
+            if "applicationframehost.exe" not in image.lower():
+                handle = api.kernel32.OpenProcess(0x0001, False, pid)
+                if handle:
+                    api.kernel32.TerminateProcess(handle, 0)
+                    api.kernel32.CloseHandle(handle)
+                    killed.add(pid)
+                continue
+            # Shared frame host: kill only the tenant app behind the CoreWindow.
+            child_pid = self._corewindow_child_pid(hwnd)
+            if child_pid and child_pid not in killed:
+                handle = api.kernel32.OpenProcess(0x0001, False, child_pid)
+                if handle:
+                    api.kernel32.TerminateProcess(handle, 0)
+                    api.kernel32.CloseHandle(handle)
+                    killed.add(child_pid)
         return len(killed)
 
-    # -- embedding -----------------------------------------------------------------
+    # -- embedding: reparented ----------------------------------------------------
 
     def is_visible(self, hwnd: int) -> bool:
         return bool(api.user32.IsWindowVisible(hwnd))
@@ -437,6 +511,23 @@ class Win32AppEmbedder:
 
     def place(self, hwnd: int, x: int, y: int, width: int, height: int) -> None:
         api.user32.MoveWindow(hwnd, x, y, width, height, True)
+
+    # -- embedding: positional overlay ---------------------------------------------
+
+    def place_top_level(self, hwnd: int, x: int, y: int, width: int, height: int) -> None:
+        """Move/resize a real top-level window without touching its hierarchy."""
+        api.user32.SetWindowPos(hwnd, None, x, y, width, height,
+                                SWP_NOZORDER | SWP_NOACTIVATE)
+
+    def show_window(self, hwnd: int, visible: bool) -> None:
+        api.user32.ShowWindow(hwnd, SW_SHOW if visible else SW_HIDE)
+
+    def stack_overlay(self, app_hwnd: int, workspace_hwnd: int) -> None:
+        """Keep the overlay app directly above the workspace in z-order."""
+        api.user32.SetWindowPos(workspace_hwnd, app_hwnd, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    # -- redraw helpers --------------------------------------------------------------
 
     def set_redraw(self, hwnd: int, on: bool) -> None:
         api.user32.SendMessageW(hwnd, WM_SETREDRAW, 1 if on else 0, 0)

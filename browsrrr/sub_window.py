@@ -16,6 +16,7 @@ MIN_SUB_WIDTH = 200
 MIN_SUB_HEIGHT = 100
 ADOPT_TICKS = 25
 ADOPT_INTERVAL_MS = 400
+SYNC_INTERVAL_MS = 66
 VERIFY_DELAY_WIN32_MS = 2500
 VERIFY_DELAY_PACKAGED_MS = 3000
 VERIFY_MAX_ATTEMPTS = 3
@@ -163,6 +164,7 @@ class SubWindow(QWidget):
         self._embedded_snapshot = embedded_snapshot
         self._embedded_command = embedded_command
         self._embedded_hwnds: list[int] = []
+        self._positional = False
         self._drag_offset = None
         self._adopt_ticks = 0
         self._verified = False
@@ -211,11 +213,13 @@ class SubWindow(QWidget):
         root.addWidget(self._title_bar)
         root.addWidget(self._content_host, 1)
 
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(SYNC_INTERVAL_MS)
+        self._sync_timer.timeout.connect(self._sync_positional)
+
         if self._embedder is not None and embedded_hwnd is not None:
             self._content_host.winId()
-            self._embedder.adopt(embedded_hwnd, int(self._content_host.winId()), show=True)
-            self._embedded_hwnds.append(embedded_hwnd)
-            self._place_embedded()
+            self._ingest(embedded_hwnd)
 
         if self._embedder is not None and (self._embedded_exe or self._embedded_pid or self._embedded_aumid):
             self._embedder.begin_tracking(
@@ -261,7 +265,11 @@ class SubWindow(QWidget):
 
         host = int(self._content_host.winId())
         for hwnd in list(self._embedded_hwnds):
-            if not self._embedder.is_hwnd_alive(hwnd) or self._embedder.hwnd_parent(hwnd) != host:
+            if not self._embedder.is_hwnd_alive(hwnd):
+                self.embed_failed.emit(self, self._embedded_command, "")
+                return
+            # Positional overlays are intentionally NOT parented to us.
+            if not self._positional and self._embedder.hwnd_parent(hwnd) != host:
                 self.embed_failed.emit(self, self._embedded_command, "")
                 return
 
@@ -272,16 +280,30 @@ class SubWindow(QWidget):
     # -- embedded app management -------------------------------------------
 
     def ingest_hwnd(self, hwnd: int, show: bool = True) -> None:
-        """Single adoption path used by the win-event hook and pollers."""
+        """Adoption entry point used by the win-event hook and pollers."""
+        self._ingest(hwnd, show=show)
+
+    def _ingest(self, hwnd: int, show: bool = True) -> None:
         if self._embedder is None or hwnd in self._embedded_hwnds:
             return
         if not self._embedder.is_hwnd_alive(hwnd):
             return
-        print(f"[diag] ingest hwnd={hwnd} title={self._embedder.hwnd_text(hwnd)!r}", flush=True)
+
+        if self._embedder.is_corewindow_hosted(hwnd):
+            # XAML/CoreWindow apps crash under SetParent: positional overlay.
+            self._positional = True
+            self._embedded_hwnds.append(hwnd)
+            print(f"[diag] ingest POSITIONAL hwnd={hwnd} "
+                  f"title={self._embedder.hwnd_text(hwnd)!r}", flush=True)
+            self._sync_timer.start()
+            self._sync_positional()
+            return
+
+        print(f"[diag] ingest REPARENTED hwnd={hwnd} "
+              f"title={self._embedder.hwnd_text(hwnd)!r}", flush=True)
         self._embedder.adopt(hwnd, int(self._content_host.winId()), show=show)
         self._embedded_hwnds.append(hwnd)
         self._place_embedded()
-        # Reparented composition-backed windows often need an explicit repaint.
         self._embedder.force_redraw(hwnd)
 
     def _pick_titled(self, hwnds) -> Optional[int]:
@@ -309,17 +331,15 @@ class SubWindow(QWidget):
                     if not self._embedder.is_main_window(hwnd):
                         continue
                     title = self._embedder.hwnd_text(hwnd)
-                    w_aumid = self._embedder.window_aumid(hwnd, diag=True)
-                    p_aumid = self._embedder.process_aumid(self._embedder._window_pid(hwnd), diag=True)
+                    cand_aumid = self._embedder.resolve_window_aumid(hwnd, diag=True)
                     if hwnd not in self._diag_seen:
                         self._diag_seen.add(hwnd)
                         print(
                             f"[diag] adopt candidate hwnd={hwnd} title={title!r} "
-                            f"window_aumid={w_aumid!r} process_aumid={p_aumid!r} "
-                            f"want={self._embedded_aumid!r}",
+                            f"resolved_aumid={cand_aumid!r} want={self._embedded_aumid!r}",
                             flush=True,
                         )
-                    if w_aumid == self._embedded_aumid or p_aumid == self._embedded_aumid:
+                    if cand_aumid == self._embedded_aumid:
                         if title:
                             best = hwnd
                             break
@@ -344,12 +364,6 @@ class SubWindow(QWidget):
             self._adopt_timer.stop()
 
     def _try_reactive_adopt(self) -> None:
-        """
-        Generalized fallback: claim a qualifying new main window when it either
-        carries a discoverable AUMID (reclassify onto it) OR belongs to the
-        launched process tree (covers stubs whose hosted window has no AUMID
-        readable from the frame host).
-        """
         if self._embedder is None or self._embedded_snapshot is None:
             return
         for hwnd in self._embedder.snapshot_caption_hwnds():
@@ -360,7 +374,7 @@ class SubWindow(QWidget):
             if not self._embedder.hwnd_text(hwnd):
                 continue
             pid = self._embedder._window_pid(hwnd)
-            aumid = self._embedder.process_aumid(pid, diag=True) or self._embedder.window_aumid(hwnd, diag=True)
+            aumid = self._embedder.resolve_window_aumid(hwnd, diag=True)
             in_tree = self._embedder.is_descendant_of(pid, self._embedded_pid or 0)
             if not aumid and not in_tree:
                 continue
@@ -373,8 +387,37 @@ class SubWindow(QWidget):
             self.ingest_hwnd(hwnd)
             return
 
+    # -- positional overlay sync ------------------------------------------------
+
+    def _sync_positional(self) -> None:
+        """Keeps a non-reparented app glued to this subwindow's content area."""
+        if not self._positional or self._embedder is None or not self._embedded_hwnds:
+            return
+        hwnd = self._embedded_hwnds[0]
+        if not self._embedder.is_hwnd_alive(hwnd):
+            self._sync_timer.stop()
+            return
+        win = self.window()
+        visible = (
+            win is not None
+            and not win.isMinimized()
+            and self.isVisible()
+            and not self._is_minimized
+        )
+        self._embedder.show_window(hwnd, visible)
+        if not visible:
+            return
+        m = SUBWINDOW_MARGIN
+        top_left = self._content_host.mapToGlobal(QPoint(m, m))
+        w = max(1, self._content_host.width() - 2 * m)
+        h = max(1, self._content_host.height() - 2 * m)
+        self._embedder.place_top_level(hwnd, top_left.x(), top_left.y(), w, h)
+        self._embedder.stack_overlay(hwnd, int(win.winId()))
+
+    # -- placement / redraw ------------------------------------------------------
+
     def _place_embedded(self) -> None:
-        if not self._embedded_hwnds or self._embedder is None:
+        if not self._embedded_hwnds or self._embedder is None or self._positional:
             return
         m = SUBWINDOW_MARGIN
         w = max(1, self._content_host.width() - 2 * m)
@@ -383,7 +426,7 @@ class SubWindow(QWidget):
             self._embedder.place(hwnd, m, m, w, h)
 
     def _set_embedded_redraw(self, on: bool) -> None:
-        if self._embedder is None:
+        if self._embedder is None or self._positional:
             return
         for hwnd in self._embedded_hwnds:
             self._embedder.set_redraw(hwnd, on)
@@ -403,6 +446,7 @@ class SubWindow(QWidget):
         else:
             self.minimize_requested.emit(self)
             self._is_minimized = True
+        self._sync_positional()
         self._notify_bounds()
 
     def toggle_maximize(self) -> None:
@@ -413,15 +457,18 @@ class SubWindow(QWidget):
             self._prev_geometry = self.geometry()
             self.setGeometry(0, 0, self.parent().width(), self.parent().height())
             self._is_maximized = True
+        self._sync_positional()
         self._notify_bounds()
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
+        self._sync_positional()
         self._notify_bounds()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._place_embedded()
+        self._sync_positional()
         self._notify_bounds()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -443,9 +490,10 @@ class SubWindow(QWidget):
             self._on_bounds_changed(self)
 
     def closeEvent(self, event) -> None:
-        """Closing a subwindow terminates its embedded app — it never escapes to desktop."""
+        """Closing a subwindow terminates its embedded app — it never escapes."""
         self._adopt_timer.stop()
         self._verify_timer.stop()
+        self._sync_timer.stop()
         if self._embedder is not None:
             self._embedder.end_tracking(self)
             if self._embedded_hwnds:
