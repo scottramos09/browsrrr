@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import os
 import subprocess
 import time
@@ -17,6 +18,8 @@ WS_THICKFRAME = 0x00040000
 WS_SYSMENU = 0x00080000
 WS_MINIMIZEBOX = 0x00020000
 WS_MAXIMIZEBOX = 0x00010000
+WS_TOOLWINDOW = 0x00000080
+GW_OWNER = 4
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
@@ -33,6 +36,10 @@ ERROR_INSUFFICIENT_BUFFER = 122
 IID_IPROPERTY_STORE = api.make_guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF90}")
 
 _PROTECTED_EXES = {"explorer.exe", "cmd.exe", "conhost.exe", "svchost.exe", "dwm.exe"}
+
+# Typed prototype for owner-window checks (canonical main-window predicate).
+api.user32.GetWindow.restype = api.HWND
+api.user32.GetWindow.argtypes = [api.HWND, wintypes.UINT]
 
 
 class ExternalAppError(RuntimeError):
@@ -66,10 +73,10 @@ class AppEmbedder(Protocol):
     def launch(self, command: str) -> subprocess.Popen: ...
     def begin_tracking(self, sub, pid: int, exe: str, aumid: str) -> None: ...
     def end_tracking(self, sub) -> None: ...
-    def find_main_hwnd_for_command(self, pid: int, command: str, timeout_seconds: float = 10.0) -> Optional[int]: ...
     def find_all_hwnds_for_launch(self, root_pid: int, exe_name: str, aumid: str) -> list[int]: ...
     def find_hwnds_by_aumid(self, aumid: str) -> list[int]: ...
     def snapshot_caption_hwnds(self) -> set[int]: ...
+    def is_main_window(self, hwnd: int) -> bool: ...
     def window_aumid(self, hwnd: int, diag: bool = False) -> str: ...
     def window_style(self, hwnd: int) -> int: ...
     def process_aumid(self, pid: int, diag: bool = False) -> str: ...
@@ -91,10 +98,10 @@ class NullAppEmbedder:
         raise ExternalAppError("External app embedding requires Windows.")
     def begin_tracking(self, sub, pid, exe, aumid): pass
     def end_tracking(self, sub): pass
-    def find_main_hwnd_for_command(self, pid, command, timeout_seconds=10.0): return None
     def find_all_hwnds_for_launch(self, root_pid, exe_name, aumid): return []
     def find_hwnds_by_aumid(self, aumid): return []
     def snapshot_caption_hwnds(self): return set()
+    def is_main_window(self, hwnd): return False
     def window_aumid(self, hwnd, diag=False): return ""
     def window_style(self, hwnd): return 0
     def process_aumid(self, pid, diag=False): return ""
@@ -112,13 +119,32 @@ class NullAppEmbedder:
 
 
 class Win32AppEmbedder:
-    """Typed, architecture-safe embedder with AUMID-aware instant adoption."""
+    """Typed, architecture-safe embedder with one canonical main-window test."""
 
     def __init__(self) -> None:
         self._tracking: dict[int, tuple] = {}  # id(sub) -> (sub, pid, exe_lower, aumid)
         self._hook = None
         self._hook_proc = api.WINEVENTPROC(self._on_win_event)
         self._install_hook()
+
+    # -- canonical predicate ----------------------------------------------------
+
+    def is_main_window(self, hwnd: int) -> bool:
+        """
+        The single definition of 'a real, adoptable app main window', used by
+        every matching path: visible, captioned, not a child, not a tool window,
+        and unowned (owned windows are dialogs/flyouts/helpers).
+        """
+        if not api.user32.IsWindowVisible(hwnd):
+            return False
+        style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
+        if not (style & WS_CAPTION):
+            return False
+        if (style & WS_CHILD) or (style & WS_TOOLWINDOW):
+            return False
+        if api.user32.GetWindow(hwnd, GW_OWNER):
+            return False
+        return True
 
     # -- creation hook: adopt windows the instant they exist ------------------
 
@@ -135,15 +161,15 @@ class Win32AppEmbedder:
             return
         if not self._tracking:
             return
-        style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
-        if not (style & WS_CAPTION) or (style & WS_CHILD):
+        if not self.is_main_window(hwnd):
             return
 
         pid = self._window_pid(hwnd)
         image_base = ""
         win_aumid = ""
         for sub, track_pid, track_exe, track_aumid in list(self._tracking.values()):
-            if hwnd in sub._embedded_hwnds:
+            # Universal rule: one primary window per subwindow, then stop.
+            if sub._embedded_hwnds or hwnd in sub._embedded_hwnds:
                 continue
             if pid == track_pid:
                 self._safe_ingest(sub, hwnd)
@@ -289,17 +315,6 @@ class Win32AppEmbedder:
 
     # -- discovery -------------------------------------------------------------
 
-    def find_main_hwnd_for_command(self, pid: int, command: str, timeout_seconds: float = 10.0) -> Optional[int]:
-        aumid = parse_aumid(command) or ""
-        exe_name = "" if aumid else os.path.basename(command.strip().strip('"')).lower()
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            found = self.find_all_hwnds_for_launch(pid, exe_name, aumid)
-            if found:
-                return found[0]
-            time.sleep(0.1)
-        return None
-
     def find_all_hwnds_for_launch(self, root_pid: int, exe_name: str, aumid: str) -> list[int]:
         tree = self._process_tree_pids(root_pid)
         exe_name = (exe_name or "").lower()
@@ -307,8 +322,7 @@ class Win32AppEmbedder:
         hidden: list[int] = []
 
         def callback(hwnd, _lparam):
-            style = api.GetWindowLongPtr(hwnd, GWL_STYLE)
-            if not (style & WS_CAPTION):
+            if not self.is_main_window(hwnd):
                 return True
             window_pid = self._window_pid(hwnd)
             match = window_pid in tree

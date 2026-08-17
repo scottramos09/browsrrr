@@ -19,8 +19,6 @@ ADOPT_INTERVAL_MS = 400
 VERIFY_DELAY_WIN32_MS = 2500
 VERIFY_DELAY_PACKAGED_MS = 3000
 VERIFY_MAX_ATTEMPTS = 3
-WS_THICKFRAME = 0x00040000
-WS_TOOLWINDOW = 0x00000080
 
 
 def edges_at(pos: QPoint, rect, margin: int) -> Qt.Edges:
@@ -284,40 +282,65 @@ class SubWindow(QWidget):
         self._embedded_hwnds.append(hwnd)
         self._place_embedded()
 
+    def _pick_titled(self, hwnds) -> Optional[int]:
+        """Prefer a titled window when several candidates arrive in one pass."""
+        fallback: Optional[int] = None
+        for hwnd in hwnds:
+            if self._embedder.hwnd_text(hwnd):
+                return hwnd
+            if fallback is None:
+                fallback = hwnd
+        return fallback
+
     def _adopt_more(self) -> None:
         if self._embedder is None:
             self._adopt_timer.stop()
             return
 
-        if self._embedded_aumid:
-            # Packaged apps: match by window/process AUMID, not exe name.
-            for hwnd in self._embedder.snapshot_caption_hwnds():
-                if hwnd in self._embedded_hwnds:
-                    continue
-                if self._embedded_snapshot is not None and hwnd in self._embedded_snapshot:
-                    continue
-                w_aumid = self._embedder.window_aumid(hwnd, diag=True)
-                p_aumid = self._embedder.process_aumid(self._embedder._window_pid(hwnd), diag=True)
-                if hwnd not in self._diag_seen:
-                    self._diag_seen.add(hwnd)
-                    print(
-                        f"[diag] adopt candidate hwnd={hwnd} "
-                        f"title={self._embedder.hwnd_text(hwnd)!r} "
-                        f"window_aumid={w_aumid!r} process_aumid={p_aumid!r} "
-                        f"want={self._embedded_aumid!r}",
-                        flush=True,
-                    )
-                if w_aumid == self._embedded_aumid or p_aumid == self._embedded_aumid:
-                    self.ingest_hwnd(hwnd)
-        else:
-            for hwnd in self._embedder.find_all_hwnds_for_launch(
-                self._embedded_pid or 0, self._embedded_exe or "", ""
-            ):
-                self.ingest_hwnd(hwnd)
-            # Stub/redirector launches: if the classic match found nothing,
-            # detect packaged windows created after launch and reclassify.
-            if not self._embedded_hwnds:
-                self._try_reactive_adopt()
+        # Universal rule: adopt ONE primary window per subwindow, then stop —
+        # identical behavior for pid/exe matches and AUMID matches.
+        if not self._embedded_hwnds:
+            if self._embedded_aumid:
+                best: Optional[int] = None
+                for hwnd in self._embedder.snapshot_caption_hwnds():
+                    if hwnd in self._embedded_hwnds:
+                        continue
+                    if self._embedded_snapshot is not None and hwnd in self._embedded_snapshot:
+                        continue
+                    if not self._embedder.is_main_window(hwnd):
+                        continue
+                    title = self._embedder.hwnd_text(hwnd)
+                    w_aumid = self._embedder.window_aumid(hwnd, diag=True)
+                    p_aumid = self._embedder.process_aumid(self._embedder._window_pid(hwnd), diag=True)
+                    if hwnd not in self._diag_seen:
+                        self._diag_seen.add(hwnd)
+                        print(
+                            f"[diag] adopt candidate hwnd={hwnd} title={title!r} "
+                            f"window_aumid={w_aumid!r} process_aumid={p_aumid!r} "
+                            f"want={self._embedded_aumid!r}",
+                            flush=True,
+                        )
+                    if w_aumid == self._embedded_aumid or p_aumid == self._embedded_aumid:
+                        if title:
+                            best = hwnd
+                            break
+                        if best is None:
+                            best = hwnd
+                if best is not None:
+                    self.ingest_hwnd(best)
+            else:
+                found = self._embedder.find_all_hwnds_for_launch(
+                    self._embedded_pid or 0, self._embedded_exe or "", ""
+                )
+                if self._embedded_snapshot is not None:
+                    found = [h for h in found if h not in self._embedded_snapshot]
+                best = self._pick_titled(found)
+                if best is not None:
+                    self.ingest_hwnd(best)
+                else:
+                    # Stub/redirector launches: discover a packaged AUMID from any
+                    # newly-created main window, regardless of the launch command.
+                    self._try_reactive_adopt()
 
         self._adopt_ticks += 1
         if self._adopt_ticks >= ADOPT_TICKS:
@@ -329,9 +352,10 @@ class SubWindow(QWidget):
         for hwnd in self._embedder.snapshot_caption_hwnds():
             if hwnd in self._embedded_snapshot or hwnd in self._embedded_hwnds:
                 continue
-            style = self._embedder.window_style(hwnd)
-            if not (style & WS_THICKFRAME) or (style & WS_TOOLWINDOW):
-                continue  # skip toasts/tool windows
+            if not self._embedder.is_main_window(hwnd):
+                continue
+            if not self._embedder.hwnd_text(hwnd):
+                continue
             pid = self._embedder._window_pid(hwnd)
             aumid = self._embedder.process_aumid(pid, diag=True) or self._embedder.window_aumid(hwnd, diag=True)
             if not aumid:

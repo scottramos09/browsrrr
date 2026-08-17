@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
 from .ai_panel import AiPanelWidget
 from .ai_service import AiAgent
 from .app_catalog import (
-    STUB_EXES,
     AppEntry,
     block_entry,
     catalog_file,
@@ -412,21 +411,20 @@ class WorkspaceWindow(QMainWindow):
     @staticmethod
     def _is_packaged(command: str) -> bool:
         """
-        Packaged classification: shell:AppsFolder AUMIDs, WindowsApps targets,
-        and System32 redirector stubs whose hosted UI cannot be reparented.
+        Only genuinely un-embeddable launch forms route externally:
+        shell:AppsFolder AUMIDs and WindowsApps targets. Everything else —
+        including redirector stubs — goes through the embed path, where
+        reactive AUMID discovery handles packaged hand-offs generically.
         """
         if parse_aumid(command):
             return True
         cand = command.strip().strip('"')
-        if ":\\" in cand and "\\windowsapps\\" in cand.lower():
-            return True
-        return Path(cand).name.lower() in STUB_EXES
+        return ":\\" in cand and "\\windowsapps\\" in cand.lower()
 
     def open_external_subwindow(self, command: str) -> None:
         aumid = parse_aumid(command)
         exe_name = "" if aumid else Path(command.strip().strip('"')).name
 
-        # Packaged/stub apps that cannot be reparented: clean external launch.
         if not aumid and self._is_packaged(command):
             self._launch_external_only(command)
             return
@@ -456,7 +454,7 @@ class WorkspaceWindow(QMainWindow):
         self._place_subwindow(sub, None, None)
 
     def _launch_external_only(self, command: str) -> None:
-        """Packaged/stub apps cannot be reparented; run them normally."""
+        """WindowsApps/AUMID launches that cannot be reparented run normally."""
         try:
             self._embedder.launch(command)
         except ExternalAppError as error:
